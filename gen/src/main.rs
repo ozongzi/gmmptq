@@ -10,10 +10,14 @@
 //!     cargo run -p gen -- check-chunks
 //!
 //! Zero dependencies, so the argument parsing is by hand -- same as `fixture`.
+mod cascade;
 mod chunks;
 mod dispatch;
+mod emit;
+mod probe;
 mod sha256;
 mod tmpl;
+mod whatif;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,9 +28,15 @@ fn usage() -> ! {
         "gen <command>\n\
          \n\
          emit --profile <name> [-o <path>]   generate kernel.asc (stdout without -o)\n\
+         emit --profile instrument --probe <name> -o <path>\n\
+         \x20                                   a WRONG-ON-PURPOSE measurement kernel\n\
          check-chunks [-v]                   verify the verbatim reassembly's sha256\n\
          plan <E> <M> <K> <N> <gt> <fp16|bf16> <counts...>\n\
          plan --all                          the 15 published points, one line each\n\
+         plan --what-if --tiles BM,BN,BK,RV[,prefetch,singleL0] [--launcher <name>]\n\
+         \x20    [--after <label>] <E> <M> <K> <N> <gt> <dtype> <counts...>\n\
+         \x20                                    where a new gate would go, what it would\n\
+         \x20                                    emit, and the table entry to paste\n\
          \n\
          \x20 plan options\n\
          \x20   --cores <n>       availableCoreNum (default 20)\n\
@@ -40,10 +50,13 @@ fn usage() -> ! {
          \n\
          classes                             the shape classifier's classes and predicates\n\
          \n\
-         profiles: verbatim  the milestone 0 safety net, the current kernel as-is\n\
-         \x20         final     the compliant submission        (milestone 1+)\n\
-         \x20         probe     with the hidden-point probes    (milestone 1+)\n\
-         \x20         spin      with the spin-to-a-fixed-time kernels (milestone 1+)\n"
+         profiles: verbatim    the milestone 0 safety net, the current kernel as-is\n\
+         \x20         final       the compliant submission: run_kernel generated from\n\
+         \x20                     the dispatch table, every body verbatim\n\
+         \x20         instrument  a decomposition probe: final with one dimension or DMA\n\
+         \x20                     extent halved. WRONG ANSWERS BY DESIGN, never submit\n\
+         \x20         probe       the GMM_ASK hidden-point content oracle (not implemented)\n\
+         \x20         spin        the spin-to-a-fixed-time kernels     (not implemented)\n"
     );
     std::process::exit(2)
 }
@@ -61,6 +74,9 @@ fn not_yet(what: &str, why: &str) -> i32 {
 enum Profile {
     Verbatim,
     Final,
+    /// Decomposition probes: deliberately-wrong measurement kernels. Named
+    /// apart from `probe` on purpose -- see `probe.rs`, "Why `instrument`".
+    Instrument,
     Probe,
     Spin,
 }
@@ -70,6 +86,7 @@ impl Profile {
         match name {
             "verbatim" => Some(Profile::Verbatim),
             "final" => Some(Profile::Final),
+            "instrument" => Some(Profile::Instrument),
             "probe" => Some(Profile::Probe),
             "spin" => Some(Profile::Spin),
             _ => None,
@@ -80,6 +97,7 @@ impl Profile {
         match self {
             Profile::Verbatim => "verbatim",
             Profile::Final => "final",
+            Profile::Instrument => "instrument",
             Profile::Probe => "probe",
             Profile::Spin => "spin",
         }
@@ -105,9 +123,15 @@ fn main() {
 fn cmd_emit(argv: &[String]) -> i32 {
     let mut profile: Option<Profile> = None;
     let mut out: Option<PathBuf> = None;
+    let mut which_probe: Option<String> = None;
     let mut at = 2;
     while at < argv.len() {
         match argv[at].as_str() {
+            "--probe" => {
+                let Some(name) = argv.get(at + 1) else { usage() };
+                which_probe = Some(name.clone());
+                at += 2;
+            }
             "--profile" | "-p" => {
                 let Some(name) = argv.get(at + 1) else { usage() };
                 let Some(parsed) = Profile::parse(name) else {
@@ -132,14 +156,19 @@ fn cmd_emit(argv: &[String]) -> i32 {
         eprintln!("gen emit: --profile is required");
         return 2;
     };
+    let dir = match chunks::chunks_dir() {
+        Ok(d) => d,
+        Err(error) => {
+            eprintln!("gen emit: {error}");
+            return 1;
+        }
+    };
+
     match profile {
         Profile::Verbatim => {}
-        Profile::Final => {
-            return not_yet(
-                "--profile final",
-                "it must refuse probe/spin constructs and per-point equality predicates, \
-                 and there is nothing to refuse until the emitters exist.",
-            );
+        Profile::Final => return emit_final(&dir, out.as_deref()),
+        Profile::Instrument => {
+            return emit_instrument(&dir, out.as_deref(), which_probe.as_deref());
         }
         Profile::Probe | Profile::Spin => {
             return not_yet(
@@ -150,13 +179,6 @@ fn cmd_emit(argv: &[String]) -> i32 {
         }
     }
 
-    let dir = match chunks::chunks_dir() {
-        Ok(d) => d,
-        Err(error) => {
-            eprintln!("gen emit: {error}");
-            return 1;
-        }
-    };
     let (bytes, report) = match chunks::verbatim(&dir) {
         Ok(pair) => pair,
         Err(error) => {
@@ -213,6 +235,116 @@ fn cmd_emit(argv: &[String]) -> i32 {
     0
 }
 
+/// `--profile final`: 44 verbatim fragments plus a generated `run_kernel`.
+///
+/// Logic equivalence is the acceptance rule here, not bytes (DESIGN.md,
+/// milestone 1..N), so there is no sha256 to compare against. What *is*
+/// checked, before a byte is written, is that every gate's shape fits its
+/// launcher's packed `dims` fields -- see `emit::run_kernel`.
+fn emit_final(dir: &std::path::Path, out: Option<&std::path::Path>) -> i32 {
+    let nodes = cascade::cascade();
+    let bytes = match emit::assemble(dir, &nodes) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("gen emit --profile final: {error}");
+            return 1;
+        }
+    };
+    let gates = cascade::gates(&nodes).len();
+    match out {
+        Some(path) => {
+            if let Err(error) = std::fs::write(path, &bytes) {
+                eprintln!("gen emit: {}: {error}", path.display());
+                return 1;
+            }
+            let lines = bytes.iter().filter(|&&b| b == b'\n').count();
+            eprintln!(
+                "{}  {}  {} bytes, {} lines; run_kernel generated from {} gates",
+                sha256::of_bytes(&bytes),
+                path.display(),
+                bytes.len(),
+                lines,
+                gates
+            );
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            if let Err(error) = lock.write_all(&bytes).and_then(|()| lock.flush()) {
+                eprintln!("gen emit: stdout: {error}");
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// `--profile instrument --probe <name>`: the `final` kernel with one
+/// dimension or DMA extent mutated, for decomposing a new point's cost.
+///
+/// It computes wrong answers. The file carries a banner and every mutated line
+/// carries `probe::MARKER`; the CLI says so twice.
+fn emit_instrument(
+    dir: &std::path::Path,
+    out: Option<&std::path::Path>,
+    which: Option<&str>,
+) -> i32 {
+    let Some(name) = which else {
+        eprintln!("gen emit --profile instrument: --probe <name> is required.\n");
+        print_probes();
+        return 2;
+    };
+    let Some(selected) = probe::find(name) else {
+        eprintln!("gen emit: unknown probe {name:?}\n");
+        print_probes();
+        return 2;
+    };
+    let bytes = match probe::instrument(dir, selected) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("gen emit --profile instrument: {error}");
+            return 1;
+        }
+    };
+    let Some(path) = out else {
+        // Refuse to put a wrong-on-purpose kernel on stdout, where it is one
+        // shell redirect away from being mistaken for a submission.
+        eprintln!(
+            "gen emit --profile instrument: -o <path> is required; an instrument kernel is \
+             never written to stdout"
+        );
+        return 2;
+    };
+    if let Err(error) = std::fs::write(path, &bytes) {
+        eprintln!("gen emit: {}: {error}", path.display());
+        return 1;
+    }
+    eprintln!(
+        "WARNING  {} is WRONG ON PURPOSE -- probe {:?}: {}",
+        path.display(),
+        selected.name,
+        selected.what
+    );
+    eprintln!("WARNING  it will fail every correctness check. Never submit it.");
+    eprintln!("read     {}", selected.read);
+    eprintln!("families {}", selected.families);
+    eprintln!("not      {}", selected.unsupported);
+    eprintln!(
+        "grep     every mutated line carries {}; a submit path should refuse on that",
+        probe::MARKER
+    );
+    0
+}
+
+fn print_probes() {
+    eprintln!("decomposition probes (deliberately wrong; measurement only):");
+    for p in probe::probes() {
+        eprintln!("  {:<14} {}", p.name, p.what);
+        eprintln!("  {:<14} read: {}", "", p.read);
+        eprintln!("  {:<14} on:   {}", "", p.families);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // plan -- a dry run of run_kernel's dispatch cascade (see dispatch.rs)
 // ---------------------------------------------------------------------------
@@ -224,6 +356,11 @@ struct PlanArgs {
     json: bool,
     positional: Vec<String>,
     misaligned: bool,
+    /// `--what-if`: synthesize a candidate gate rather than route only.
+    what_if: bool,
+    tiles: Option<String>,
+    launcher: String,
+    after: Option<String>,
 }
 
 fn parse_plan_args(argv: &[String]) -> Result<PlanArgs, String> {
@@ -233,11 +370,31 @@ fn parse_plan_args(argv: &[String]) -> Result<PlanArgs, String> {
         json: false,
         positional: Vec::new(),
         misaligned: false,
+        what_if: false,
+        tiles: None,
+        launcher: "LaunchActivePacked224".to_string(),
+        after: None,
     };
     let mut aic: Option<u32> = None;
     let mut at = 2;
     while at < argv.len() {
         match argv[at].as_str() {
+            "--what-if" => {
+                args.what_if = true;
+                at += 1;
+            }
+            "--tiles" => {
+                args.tiles = Some(argv.get(at + 1).ok_or("--tiles needs BM,BN,BK,RV")?.clone());
+                at += 2;
+            }
+            "--launcher" => {
+                args.launcher = argv.get(at + 1).ok_or("--launcher needs a name")?.clone();
+                at += 2;
+            }
+            "--after" => {
+                args.after = Some(argv.get(at + 1).ok_or("--after needs a gate label")?.clone());
+                at += 2;
+            }
             "--all" => {
                 args.all = true;
                 at += 1;
@@ -352,6 +509,36 @@ fn cmd_plan(argv: &[String]) -> i32 {
         bf,
         counts: numbers[5..].to_vec(),
     };
+    if args.what_if {
+        let Some(spec) = args.tiles.as_deref() else {
+            eprintln!("gen plan --what-if: --tiles BM,BN,BK,RV[,prefetch,singleL0] is required");
+            return 2;
+        };
+        let tiles = match whatif::Tiles::parse(spec) {
+            Ok(t) => t,
+            Err(error) => {
+                eprintln!("gen plan: {error}");
+                return 2;
+            }
+        };
+        let packer = match whatif::launcher(&args.launcher) {
+            Ok(p) => p,
+            Err(error) => {
+                eprintln!("gen plan: {error}");
+                return 2;
+            }
+        };
+        let what = match whatif::build(&shape, tiles, packer, args.after.as_deref()) {
+            Ok(w) => w,
+            Err(error) => {
+                eprintln!("gen plan: {error}");
+                return 2;
+            }
+        };
+        let refused = !what.packing.is_empty();
+        whatif::report(&shape, &args.env, &what);
+        return if refused { 1 } else { 0 };
+    }
     let routed = match dispatch::route(&shape, &args.env) {
         Ok(r) => r,
         Err(error) => {

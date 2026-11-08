@@ -3,28 +3,27 @@
 //! `kernel/kernel.asc:5814..6121` is a flat `if ... return` cascade. Widening or
 //! narrowing one gate can silently reroute a *different* test point onto a
 //! slower arm, and the only check we had was "compile and time all 15 points on
-//! the NPU". This module transcribes the cascade so that check costs a
-//! millisecond instead of a device slot.
+//! the NPU". This module runs that check in a millisecond instead of a device
+//! slot.
 //!
-//! Faithfulness rules I held myself to:
+//! The gates themselves no longer live here: they live in [`crate::cascade`] as
+//! data, and this module *evaluates* that data while `emit --profile final`
+//! *prints* it. Before, the predicates existed twice -- once as C++ in
+//! `gen/chunks/5814-run-kernel.inc`, once as Rust control flow here -- and
+//! nothing could tell you the two had drifted.
 //!
-//!   * source order, one arm at a time, each tagged with the label
-//!     `gen/CURRENT.md` gives it and the kernel.asc line number;
-//!   * `ConfigureCubeFullK` is a function with the real arithmetic (2851), not a
-//!     summary, because gates T/U/V/W/X/Y all branch on whether it succeeds;
-//!   * gate X passes `p` **by reference** (6097) while T/U/V/W/Y operate on a
-//!     `Plan` copy -- preserved, because it decides what Y and Z see;
-//!   * the predicates that read *pointer values* rather than shapes are explicit
-//!     inputs with documented defaults, and `plan` says which decisions used
-//!     them and what the route would be under the opposite assumption.
+//! What stayed here is everything a table cannot express:
 //!
-//! Label scheme (ours, per CURRENT.md): letters run in source order over every
-//! numbered element of the cascade, so three letters land on derived booleans
-//! rather than on branches -- C = `scalarOutputWindow` (5854), G =
-//! `tinyCacheAligned` (5914), Q = the `Plan p` construction (6006), and V = the
-//! `packWeights` bool (6065). That is the only assignment consistent with every
-//! anchor CURRENT.md states (B=5845, D=5858, E'=5876, F=5888, H=5919, K.1=5951,
-//! L.1=5967, N=5983, R.1=6015, V=6065, X=6096, Y=6103, Z=6112).
+//!   * the arithmetic the gates call out to (`ConfigureCubeFullK`,
+//!     `LeanPlanCube`, `BuildOuterTiling`, `BuildBalancedOverlapShortGroup`);
+//!   * the per-arm result -- which kernel symbol, what grid, how much scratch;
+//!   * the two capacity `Select` ladders and `mix11::Launch`'s demotion, which
+//!     are in other translation-unit fragments, not in `run_kernel`;
+//!   * gate X's by-reference `Plan`, which is why `Cfg.target` is data.
+
+use crate::cascade::{self, Cfg, Expr, Gate, Node, Op, Q, R};
+
+pub use crate::cascade::Dep;
 
 // ---------------------------------------------------------------------------
 // machine constants (kernel.asc:10..14)
@@ -150,6 +149,79 @@ pub struct Plan {
     pub kl: u32,
     pub n_tiles: u32,
     pub rv: u32,
+}
+
+/// Everything a predicate term can read. One value, built once per route, so a
+/// `Q` has somewhere to look its number up.
+#[derive(Clone, Debug)]
+pub struct Ctx {
+    pub shape: Shape,
+    pub env: Env,
+    /// The `Plan` as the construction at 6006 leaves it. The gates before that
+    /// line read only `M/K/N/E`, so filling it eagerly is harmless.
+    pub plan: Plan,
+    pub scalar_output_window: bool,
+    pub tiny_cache_aligned: bool,
+    pub pack_weights: bool,
+    /// Gate F's `scalar` (5890).
+    pub scalar: bool,
+    /// Gate R's locals (6013).
+    pub selected_pitch: u32,
+    pub selected_ub: u64,
+}
+
+impl Ctx {
+    pub fn new(nodes: &[Node], shape: &Shape, env: &Env) -> Ctx {
+        let (m, n) = (shape.m, shape.n);
+        let plan = Plan {
+            m,
+            k: shape.k,
+            n,
+            e: shape.e,
+            list_type: shape.group_list_type,
+            kp: up(shape.k, 32),
+            wstride: n,
+            cores: env.available_core_num,
+            vcores: env.available_core_num * 2,
+            ..Default::default()
+        };
+        let pitch = up(n, 16);
+        let nup = up(n, 32);
+        let mut ctx = Ctx {
+            shape: shape.clone(),
+            env: *env,
+            plan,
+            scalar_output_window: u64::from(env.ptrs.y & 127)
+                + u64::from(m) * u64::from(n) * 2
+                <= 32,
+            tiny_cache_aligned: (env.ptrs.any_of_six() & 63) == 0,
+            pack_weights: false,
+            scalar: false,
+            selected_pitch: pitch,
+            selected_ub: 32u64 * u64::from(pitch) * 6
+                + 12 * u64::from(nup)
+                + 80 * 32
+                + u64::from(nup)
+                + 32
+                + 32
+                + 32,
+        };
+        // The two derived booleans whose own definitions are table data. They
+        // never read each other, so one pass in table order is enough.
+        for node in nodes {
+            if let Node::Derived(d) = node {
+                if d.name == "packWeights" {
+                    ctx.pack_weights = d.eval(&ctx);
+                }
+            }
+        }
+        if let Some(f) = cascade::find(nodes, "F") {
+            if let Some(d) = f.derived.iter().find(|d| d.name == "scalar") {
+                ctx.scalar = d.eval(&ctx);
+            }
+        }
+        ctx
+    }
 }
 
 /// `ConfigureCubeFullK<BM,BN,BK,RV,Prefetch,SingleL0>` (2851).
@@ -356,10 +428,10 @@ fn build_outer_tiling(p: &Plan) -> VTiling {
 // bit packing
 // ---------------------------------------------------------------------------
 
-/// One field of a packed `uint32_t dims`. `gate_max` is the largest *encoded*
-/// value the gate that reaches this packer permits; `None` means the gate does
-/// not bound the packed quantity at all, which is the CURRENT.md landmine-1
-/// class of bug.
+/// One field of a packed `uint32_t dims`, as `plan` reports it. Built from the
+/// gate's [`cascade::Packer`]: `value` from the shape, `gate_max` from the
+/// gate's own predicate. `None` means the gate does not bound the packed
+/// quantity at all, which is the CURRENT.md landmine-1 class of bug.
 #[derive(Clone, Debug)]
 pub struct Field {
     pub name: &'static str,
@@ -385,14 +457,10 @@ impl Field {
     }
 }
 
-fn f(
-    name: &'static str,
-    shift: u32,
-    width: u32,
-    value: u64,
-    gate_max: Option<u64>,
-) -> Field {
-    Field { name, shift, width, value, gate_max, incidental: None }
+/// The `dims` word a field list encodes, so `plan` can print the same number
+/// the host computes instead of a second copy of the packing expression.
+pub fn pack_value(fields: &[Field]) -> u64 {
+    fields.iter().fold(0u64, |acc, f| acc | (f.value << f.shift))
 }
 
 // ---------------------------------------------------------------------------
@@ -400,19 +468,10 @@ fn f(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Dep {
-    Shape,
-    /// Reads a device pointer value.
-    Ptr,
-    /// Reads `availableCoreNum` or `GetCoreNumAic()`.
-    Cores,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Outcome {
     Pass,
     Fail,
-    /// A derived value, not a branch (labels C, G, Q, V).
+    /// A derived value, not a branch.
     Note,
 }
 
@@ -426,68 +485,60 @@ pub struct Step {
     pub deps: Vec<Dep>,
 }
 
-/// Builds one gate's conjunction, remembering the first failing term.
-struct G {
-    label: String,
-    line: u32,
-    ok: bool,
-    first_fail: Option<String>,
-    deps: Vec<Dep>,
-    summary: Vec<String>,
+/// Evaluate one gate's conjunction from the table, short-circuiting exactly as
+/// `&&` does, and report which term decided it.
+///
+/// `plan` is what a `ConfigureCubeFullK` term writes: a fresh copy for T/U/W/Y,
+/// the caller's own `p` for X.
+fn eval_gate(gate: &Gate, c: &Ctx, plan: &mut Plan) -> (bool, Step) {
+    let mut ok = true;
+    let mut first_fail = String::new();
+    let mut deps: Vec<Dep> = Vec::new();
+    let mut summary: Vec<String> = Vec::new();
+    for term in &gate.pred {
+        if !ok {
+            // `&&` never reaches this term, so it contributes no dependency:
+            // claiming one would be noise in exactly the report that matters.
+            break;
+        }
+        let dep = term.dep();
+        if dep != Dep::Shape && !deps.contains(&dep) {
+            deps.push(dep);
+        }
+        if term.eval(c, plan) {
+            summary.push(term.show(c));
+        } else {
+            first_fail = term.show(c);
+            ok = false;
+        }
+    }
+    let step = Step {
+        label: gate.label.to_string(),
+        line: gate.line,
+        outcome: if ok { Outcome::Pass } else { Outcome::Fail },
+        detail: if ok {
+            if summary.is_empty() {
+                "unconditional".to_string()
+            } else {
+                summary.join(" && ")
+            }
+        } else {
+            first_fail
+        },
+        deps,
+    };
+    (ok, step)
 }
 
-impl G {
-    fn new(label: &str, line: u32) -> G {
-        G {
-            label: label.to_string(),
-            line,
-            ok: true,
-            first_fail: None,
-            deps: Vec::new(),
-            summary: Vec::new(),
-        }
-    }
-    fn term(&mut self, expr: impl Into<String>, ok: bool, dep: Dep) -> &mut G {
-        let expr = expr.into();
-        // Record the dependency only if `&&` actually reaches this term. A gate
-        // that fails on a shape term never reads a pointer, so claiming it as
-        // pointer-dependent would be noise in exactly the report that matters.
-        if self.ok && dep != Dep::Shape && !self.deps.contains(&dep) {
-            self.deps.push(dep);
-        }
-        if !ok && self.first_fail.is_none() {
-            self.first_fail = Some(expr.clone());
-            self.ok = false;
-        }
-        if self.ok {
-            self.summary.push(expr);
-        }
-        self
-    }
-    fn t(&mut self, expr: impl Into<String>, ok: bool) -> &mut G {
-        self.term(expr, ok, Dep::Shape)
-    }
-    fn p(&mut self, expr: impl Into<String>, ok: bool) -> &mut G {
-        self.term(expr, ok, Dep::Ptr)
-    }
-    fn c(&mut self, expr: impl Into<String>, ok: bool) -> &mut G {
-        self.term(expr, ok, Dep::Cores)
-    }
-    fn passed(&self) -> bool {
-        self.ok
-    }
-    fn step(&self) -> Step {
-        Step {
-            label: self.label.clone(),
-            line: self.line,
-            outcome: if self.ok { Outcome::Pass } else { Outcome::Fail },
-            detail: if self.ok {
-                self.summary.join(" && ")
-            } else {
-                self.first_fail.clone().unwrap_or_default()
-            },
-            deps: self.deps.clone(),
-        }
+fn derived_step(d: &cascade::Derived, c: &Ctx) -> Step {
+    let value = d.eval(c);
+    let shown: Vec<String> = d.terms.iter().map(|t| t.show(c)).collect();
+    Step {
+        label: d.name.to_string(),
+        line: d.line,
+        outcome: Outcome::Note,
+        detail: format!("{} = {value}  <- {}", d.name, shown.join(&format!(" {} ", d.join))),
+        deps: d.terms.iter().map(|t| t.dep()).filter(|dep| *dep != Dep::Shape).collect(),
     }
 }
 
@@ -558,16 +609,27 @@ impl Routed {
 }
 
 // ---------------------------------------------------------------------------
-// the cascade
+// the cascade, evaluated
 // ---------------------------------------------------------------------------
 
+/// Route a shape through the shipped cascade.
 pub fn route(s: &Shape, env: &Env) -> Result<Routed, String> {
+    route_with(&cascade::cascade(), s, env)
+}
+
+/// Route a shape through *a* cascade -- the shipped one, or a candidate that
+/// `plan --what-if` built without touching the table.
+///
+/// This is a **walk of the table**, not a hand-written chain: the loop below
+/// visits the nodes in table order, and a gate the evaluator has no bespoke arm
+/// for still gets evaluated, in its table position, through `generic_arm`. That
+/// is what makes adding a gate a data change -- insert a `Node::Gate` and both
+/// `plan` and `emit` pick it up, at the position you inserted it.
+pub fn route_with(nodes: &[Node], s: &Shape, env: &Env) -> Result<Routed, String> {
     let mut tr: Vec<Step> = Vec::new();
     let (m, k, n, e) = (s.m, s.k, s.n, s.e);
     let bf = s.bf;
     let gt = s.group_list_type;
-    let cores64 = u64::from(env.available_core_num);
-    let ptr = &env.ptrs;
 
     // --- A: host validation (5824, 5840) -------------------------------------
     if gt > 1 {
@@ -589,1150 +651,37 @@ pub fn route(s: &Shape, env: &Env) -> Result<Routed, String> {
         deps: vec![],
     });
 
-    // --- B: non-natural typed input views -> TinyShortReduction (5845) --------
-    {
-        let mut g = G::new("B", 5845);
-        g.t(format!("K({k})<=8"), k <= 8)
-            .t(format!("E({e})<=16"), e <= 16)
-            .t(format!("M*N({})<=64", u64::from(m) * u64::from(n)), u64::from(m) * u64::from(n) <= 64)
-            .p(
-                "any-of(xScale&3, weightScale&(bf?1:3), groupList&7) != 0",
-                (ptr.x_scale & 3) != 0
-                    || (ptr.w_scale & if bf { 1 } else { 3 }) != 0
-                    || (ptr.group_list & 7) != 0,
-            );
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            return Ok(Routed::new(
-                tr,
-                "B",
-                5845,
-                &format!("TinyShortReduction<{}>", bf),
-                1,
-                "<<<1>>>",
-            )
-            .with_pack(vec![
-                f("M-1", 0, 6, u64::from(m - 1), Some(63)),
-                f("N-1", 6, 6, u64::from(n - 1), Some(63)),
-                f("K-1", 12, 3, u64::from(k - 1), Some(7)),
-                f("E-1", 15, 4, u64::from(e - 1), Some(15)),
-                f("gt", 19, 1, u64::from(gt), Some(1)),
-            ]));
-        }
-    }
+    let ctx = Ctx::new(nodes, s, env);
+    // The `Plan p` the construction at 6006 leaves. Gate X configures *this*
+    // object by reference (6097); every other arm configures a copy.
+    let mut p = ctx.plan;
 
-    // --- C: scalarOutputWindow (5854) ----------------------------------------
-    let scalar_output_window = u64::from(ptr.y & 127) + u64::from(m) * u64::from(n) * 2 <= 32;
-    tr.push(Step {
-        label: "C".into(),
-        line: 5854,
-        outcome: Outcome::Note,
-        detail: format!(
-            "scalarOutputWindow = (y&127={}) + M*N*2={} <= 32 -> {scalar_output_window}",
-            ptr.y & 127,
-            u64::from(m) * u64::from(n) * 2
-        ),
-        deps: vec![Dep::Ptr],
-    });
-
-    let six_aligned_64 = (ptr.any_of_six() & 63) == 0;
-
-    // --- D: 2x2 register microtile, expert-parallel (5858) --------------------
-    {
-        let mut g = G::new("D", 5858);
-        g.t("!bf", !bf)
-            .t("groupListType==0", gt == 0)
-            .t(format!("E({e})>=2"), e >= 2)
-            .t(format!("E({e})<=M({m})"), e <= m)
-            .t(format!("M({m})<=4"), m <= 4)
-            .c(format!("E<=2*cores({})", 2 * cores64), u64::from(e) <= 2 * cores64)
-            .t(format!("K({k})==2"), k == 2)
-            .t(format!("N({n})==2"), n == 2)
-            .p("scalarOutputWindow", scalar_output_window)
-            .p("all six pointers 64B aligned", six_aligned_64);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let row_dims = u64::from(m - 1)
-                | (u64::from(n - 1) << 2)
-                | (u64::from(k - 1) << 7)
-                | (u64::from(e - 1) << 10)
-                | (u64::from(gt) << 17);
-            let mut r = Routed::new(
-                tr,
-                "D",
-                5858,
-                "expert_output::SearchTinyExpertOutput6400000<float,half>",
-                e,
-                "<<<E>>>",
-            )
-            .with_pack(vec![
-                f("M-1", 0, 2, u64::from(m - 1), Some(3)),
-                f("N-1", 2, 5, u64::from(n - 1), Some(1)),
-                f("K-1", 7, 3, u64::from(k - 1), Some(1)),
-                f("E-1", 10, 7, u64::from(e - 1), Some(3)),
-                f("gt", 17, 1, 0, Some(0)),
-            ]);
-            r.notes.push(format!("rowDims = {row_dims}"));
-            r.notes.push("AIV path: launches asynchronously, no aclrtSynchronizeStream".into());
-            return Ok(r);
-        }
-    }
-
-    // --- E: single register-capacity algorithm (5871) --------------------------
-    {
-        let mut g = G::new("E", 5871);
-        g.t(format!("M*K({})<=8", u64::from(m) * u64::from(k)), u64::from(m) * u64::from(k) <= 8)
-            .t(format!("K*N({})<=8", u64::from(k) * u64::from(n)), u64::from(k) * u64::from(n) <= 8)
-            .t(format!("M*4({})<=16", u64::from(m) * 4), u64::from(m) * 4 <= 16)
-            .t(
-                format!("N*(bf?2:4)({})<=8", u64::from(n) * if bf { 2 } else { 4 }),
-                u64::from(n) * if bf { 2 } else { 4 } <= 8,
-            )
-            .t(
-                format!("M*N*2({})<=16", u64::from(m) * u64::from(n) * 2),
-                u64::from(m) * u64::from(n) * 2 <= 16,
-            )
-            .p("scalarOutputWindow", scalar_output_window)
-            .p("y&1==0", (ptr.y & 1) == 0);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let dims = u64::from(m - 1)
-                | (u64::from(k - 1) << 2)
-                | (u64::from(n - 1) << 5)
-                | (u64::from(e - 1) << 7)
-                | (u64::from(gt) << 14);
-            let pack = vec![
-                f("M-1", 0, 2, u64::from(m - 1), Some(3)),
-                f("K-1", 2, 3, u64::from(k - 1), Some(7)),
-                f("N-1", 5, 2, u64::from(n - 1), Some(3)),
-                f("E-1", 7, 7, u64::from(e - 1), Some(127)),
-                f("gt", 14, 1, u64::from(gt), Some(1)),
-            ];
-            // E': naturally aligned single-line groupList batch -> contract.
-            let mut g2 = G::new("E'", 5876);
-            g2.t(format!("E({e})>=2"), e >= 2)
-                .t(format!("E({e})<=8"), e <= 8)
-                .p("groupList&7==0", (ptr.group_list & 7) == 0)
-                .p(
-                    format!("(groupList&63={})+E*8<=64", ptr.group_list & 63),
-                    u64::from(ptr.group_list & 63) + u64::from(e) * 8 <= 64,
-                );
-            let contract = g2.passed();
-            tr.push(g2.step());
-            // The Select ladders decode from `dims`, so they see truncated m/k/n.
-            let dm = (dims & 3) as u32 + 1;
-            let dk = ((dims >> 2) & 7) as u32 + 1;
-            let dn = ((dims >> 5) & 3) as u32 + 1;
-            if contract {
-                let arm = contract_select(dm, dk, dn, bf);
-                let mut r = match arm {
-                    Some((cm, ck, cn)) => Routed::new(
-                        tr,
-                        "E'",
-                        5876,
-                        &format!(
-                            "tiny_capacity_contract::SearchTinyCapacityContract11850017<{bf},{cm},{ck},{cn}>"
+    for node in nodes {
+        match node {
+            Node::Fixed { label, line, .. } => {
+                if *label == "Q" {
+                    tr.push(Step {
+                        label: "Q".into(),
+                        line: *line,
+                        outcome: Outcome::Note,
+                        detail: format!(
+                            "Plan p: kp=UpH(k,32)={} wstride=n={} cores={} vcores={} rowsPerExpert={}",
+                            p.kp,
+                            p.wstride,
+                            p.cores,
+                            p.vcores,
+                            p.m / p.e
                         ),
-                        1,
-                        "<<<1>>>",
-                    ),
-                    None => {
-                        let mut r = Routed::new(tr, "E'", 5876, "tiny_capacity_contract::Select -- no arm", 0, "none");
-                        r.errors.push(format!(
-                            "tiny_capacity_contract::Select (5546) has no arm for (m={dm},k={dk},n={dn},bf={bf}); \
-                             it throws std::invalid_argument at 5727 -> RE"
-                        ));
-                        r
-                    }
-                }
-                .with_pack(pack);
-                r.notes.push(format!("dims = {dims}; Select decodes m={dm} k={dk} n={dn}"));
-                return Ok(r);
-            }
-            let arm = unrolled_select(dk, dn, bf);
-            let mut r = match arm {
-                Some((ck, cn)) => Routed::new(
-                    tr,
-                    "E''",
-                    5882,
-                    &format!(
-                        "tiny_capacity_unrolled::SearchTinyCapacityUnrolled11850012<{bf},{ck},{cn}>"
-                    ),
-                    1,
-                    "<<<1>>>",
-                ),
-                None => {
-                    let mut r = Routed::new(tr, "E''", 5882, "tiny_capacity_unrolled::Select -- no arm", 0, "none");
-                    r.errors.push(format!(
-                        "tiny_capacity_unrolled::Select (5337) has no arm for (k={dk},n={dn},bf={bf}); \
-                         it throws std::invalid_argument at 5414 -> RE"
-                    ));
-                    r
+                        deps: vec![Dep::Cores],
+                    });
                 }
             }
-            .with_pack(pack);
-            r.notes.push(format!("dims = {dims}; Select decodes k={dk} n={dn}"));
-            return Ok(r);
-        }
-    }
-
-    // --- F: one row, two interleaved channels (5888) --------------------------
-    {
-        let mut g = G::new("F", 5888);
-        g.t(format!("E({e})==1"), e == 1)
-            .t(format!("M({m})==1"), m == 1)
-            .t(format!("N({n})==2"), n == 2)
-            .t(format!("K({k})>=1024"), k >= 1024)
-            .t(format!("K({k})<=8192"), k <= 8192);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let scalar = (ptr.y & 31) == 0 && scalar_output_window;
-            let cap: u32 = if k <= 1024 {
-                1024
-            } else if k <= 2048 {
-                2048
-            } else if k <= 4096 {
-                4096
-            } else {
-                8192
-            };
-            // longdot_capacity::Launch (3635): fp16 with misaligned scales takes
-            // the DMA variant; bf16 has no DMA variant.
-            let dma = !bf && ((ptr.x_scale | ptr.w_scale) & 3) != 0;
-            let kernel = if dma {
-                format!("longdot_capacity::SearchLongDotCapacityDMAScales<{cap},{scalar}>")
-            } else {
-                format!("longdot_capacity::SearchLongDotCapacity11840033<{cap},{bf},{scalar}>")
-            };
-            let mut r = Routed::new(tr, "F", 5888, &kernel, 2, "<<<2>>>");
-            r.notes.push(format!(
-                "K ladder: K={k} -> Capacity={cap}; scalar={scalar} (y&31==0 && scalarOutputWindow)"
-            ));
-            if dma {
-                r.notes.push("DMA-scales variant chosen: (xScale|weightScale)&3 != 0".into());
-            } else if !bf {
-                r.notes
-                    .push("scalar-scales variant: (xScale|weightScale)&3 == 0 [pointer-dependent]".into());
-            }
-            r.notes.push("K is a runtime argument, not packed -- no bit fields".into());
-            return Ok(r);
-        }
-    }
-
-    // --- G: tinyCacheAligned (5914) -------------------------------------------
-    tr.push(Step {
-        label: "G".into(),
-        line: 5914,
-        outcome: Outcome::Note,
-        detail: format!("tinyCacheAligned = all six pointers 64B aligned -> {six_aligned_64}"),
-        deps: vec![Dep::Ptr],
-    });
-
-    let m_n = u64::from(m) * u64::from(n);
-    let m_k = u64::from(m) * u64::from(k);
-    let k_n = u64::from(k) * u64::from(n);
-    let n_bytes = u64::from(n) * if bf { 2 } else { 4 };
-
-    // --- H: SearchTinyE1STDev3400000 (5919) -----------------------------------
-    {
-        let mut g = G::new("H", 5919);
-        g.p("scalarOutputWindow", scalar_output_window)
-            .t(format!("E({e})==1"), e == 1)
-            .t(format!("M({m})<=4"), m <= 4)
-            .c(format!("M<=2*cores({})", 2 * cores64), u64::from(m) <= 2 * cores64)
-            .t(format!("N({n})<=32"), n <= 32)
-            .t(format!("K({k})<=8"), k <= 8)
-            .t(format!("M*N({m_n})<=32"), m_n <= 32)
-            .t(format!("M*K({m_k})<=64"), m_k <= 64)
-            .t(format!("K*N({k_n})<=64"), k_n <= 64)
-            .t(format!("M*4({})<=64", u64::from(m) * 4), u64::from(m) * 4 <= 64)
-            .t(format!("N*(bf?2:4)({n_bytes})<=64"), n_bytes <= 64)
-            .t(format!("N({n})<=2"), n <= 2);
-        if g.passed() {
-            g.p(
-                format!("y&(2N-1)=={}", ptr.y & (n * 2 - 1)),
-                (ptr.y & (n * 2 - 1)) == 0,
-            );
-        }
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let kern = if bf {
-                "SearchTinyE1STDev3400000<bfloat16_t,bfloat16_t>"
-            } else {
-                "SearchTinyE1STDev3400000<float,half>"
-            };
-            let mut r = Routed::new(tr, "H", 5919, kern, m, "<<<M>>>").with_pack(vec![
-                f("M-1", 0, 2, u64::from(m - 1), Some(3)),
-                f("N-1", 2, 5, u64::from(n - 1), Some(1)),
-                f("K-1", 7, 3, u64::from(k - 1), Some(7)),
-                f("gt", 17, 1, u64::from(gt), Some(1)),
-            ]);
-            r.notes.push(
-                "rowDims omits the E field (5923) while the decoder reads bits 10..16 (4957); \
-                 correct only because H requires E==1 [CURRENT.md landmine 6]"
-                    .into(),
-            );
-            return Ok(r);
-        }
-    }
-
-    // --- I: E1FixedUbRowTiny (5928) -------------------------------------------
-    {
-        let mut g = G::new("I", 5928);
-        g.t(format!("E({e})==1"), e == 1)
-            .t(format!("M({m})<=4"), m <= 4)
-            .c(format!("M<=2*cores({})", 2 * cores64), u64::from(m) <= 2 * cores64)
-            .t(format!("N({n})<=32"), n <= 32)
-            .t(format!("K({k})<=8"), k <= 8)
-            .t(format!("M*N({m_n})<=32"), m_n <= 32)
-            .t(format!("M*K({m_k})<=64"), m_k <= 64)
-            .t(format!("K*N({k_n})<=64"), k_n <= 64)
-            .t(format!("M*4({})<=64", u64::from(m) * 4), u64::from(m) * 4 <= 64)
-            .t(format!("N*(bf?2:4)({n_bytes})<=64"), n_bytes <= 64);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let kern = if bf {
-                "E1FixedUbRowTiny<bfloat16_t,bfloat16_t>"
-            } else {
-                "E1FixedUbRowTiny<float,half>"
-            };
-            return Ok(Routed::new(tr, "I", 5928, kern, m, "<<<M>>>").with_pack(vec![
-                f("M-1", 0, 2, u64::from(m - 1), Some(3)),
-                f("N-1", 2, 5, u64::from(n - 1), Some(31)),
-                f("K-1", 7, 3, u64::from(k - 1), Some(7)),
-                f("gt", 17, 1, u64::from(gt), Some(1)),
-            ]));
-        }
-    }
-
-    // --- J: TinyCacheReduction (5937) -----------------------------------------
-    {
-        let mut g = G::new("J", 5937);
-        g.t(format!("E({e})==1"), e == 1)
-            .t(format!("K({k})<=8"), k <= 8)
-            .t(format!("M*N({m_n})<=32"), m_n <= 32)
-            .t(format!("M*K({m_k})<=64"), m_k <= 64)
-            .t(
-                format!("E*K*N({})<=64", u64::from(e) * k_n),
-                u64::from(e) * k_n <= 64,
-            )
-            .t(format!("M*4({})<=64", u64::from(m) * 4), u64::from(m) * 4 <= 64)
-            .t(
-                format!("E*N*(bf?2:4)({})<=64", u64::from(e) * n_bytes),
-                u64::from(e) * n_bytes <= 64,
-            )
-            .p("tinyCacheAligned", six_aligned_64);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let mut r = Routed::new(tr, "J", 5937, &format!("TinyCacheReduction<{bf}>"), 1, "<<<1>>>")
-                .with_pack(vec![
-                    f("M-1", 0, 4, u64::from(m - 1), Some(3)),
-                    f("N-1", 4, 5, u64::from(n - 1), Some(31)),
-                    f("K-1", 9, 3, u64::from(k - 1), Some(7)),
-                    f("E-1", 12, 3, u64::from(e - 1), Some(0)),
-                    f("gt", 15, 1, u64::from(gt), Some(1)),
-                ]);
-            r.notes.push(
-                "tinyCacheDims packs M-1 in 4 bits and E-1 in 3 bits (5940); both overflows are \
-                 blocked only by unrelated clauses [CURRENT.md landmine 6]"
-                    .into(),
-            );
-            return Ok(r);
-        }
-    }
-
-    // --- K: GT0 expert intervals (5949) ---------------------------------------
-    {
-        let mut g = G::new("K", 5949);
-        g.t("groupListType==0", gt == 0)
-            .t(format!("E({e})>=2"), e >= 2)
-            .t(format!("E({e})<=M({m})"), e <= m)
-            .t(format!("M({m})<=4"), m <= 4)
-            .c(format!("E<=2*cores({})", 2 * cores64), u64::from(e) <= 2 * cores64)
-            .t(format!("K({k})<=8"), k <= 8)
-            .t(format!("N({n})<=32"), n <= 32)
-            .t(format!("M*N({m_n})<=32"), m_n <= 32);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let pack = vec![
-                f("M-1", 0, 2, u64::from(m - 1), Some(3)),
-                f("N-1", 2, 5, u64::from(n - 1), Some(31)),
-                f("K-1", 7, 3, u64::from(k - 1), Some(7)),
-                f("E-1", 10, 7, u64::from(e - 1), Some(3)),
-                f("gt", 17, 1, 0, Some(0)),
-            ];
-            if k == 2 && n == 2 {
-                let mut g1 = G::new("K.1", 5951);
-                g1.t("K==2 && N==2", true)
-                    .t("!bf", !bf)
-                    .p("tinyCacheAligned", six_aligned_64)
-                    .p("scalarOutputWindow", scalar_output_window);
-                let one = g1.passed();
-                tr.push(g1.step());
-                if one {
-                    return Ok(Routed::new(
-                        tr,
-                        "K.1",
-                        5951,
-                        "expert_output::SearchTinyExpertOutput6400000<float,half>",
-                        e,
-                        "<<<E>>>",
-                    )
-                    .with_pack(pack));
+            Node::Derived(d) => tr.push(derived_step(d, &ctx)),
+            Node::Gate(gate) => {
+                if let Some(result) = try_gate(nodes, gate, &ctx, &mut p, &mut tr) {
+                    return result;
                 }
-                let kern = if bf {
-                    "expert_reuse::SearchTinyExpertReuse6300000<bfloat16_t,bfloat16_t>"
-                } else {
-                    "expert_reuse::SearchTinyExpertReuse6300000<float,half>"
-                };
-                return Ok(Routed::new(tr, "K.2", 5956, kern, e, "<<<E>>>").with_pack(pack));
             }
-            let kern = if bf {
-                "SearchTinyExpert3500000<bfloat16_t,bfloat16_t>"
-            } else {
-                "SearchTinyExpert3500000<float,half>"
-            };
-            return Ok(Routed::new(tr, "K", 5949, kern, e, "<<<E>>>").with_pack(pack));
-        }
-    }
-
-    // --- L: one vector core per short output row (5965) -----------------------
-    {
-        let mut g = G::new("L", 5965);
-        g.t(format!("M({m})<=4"), m <= 4)
-            .c(format!("M<=2*cores({})", 2 * cores64), u64::from(m) <= 2 * cores64)
-            .t(format!("N({n})<=32"), n <= 32)
-            .t(format!("K({k})<=8"), k <= 8);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let pack = vec![
-                f("M-1", 0, 2, u64::from(m - 1), Some(3)),
-                f("N-1", 2, 5, u64::from(n - 1), Some(31)),
-                f("K-1", 7, 3, u64::from(k - 1), Some(7)),
-                f("E-1", 10, 7, u64::from(e - 1), Some(127)),
-                f("gt", 17, 1, u64::from(gt), Some(1)),
-            ];
-            let mut g1 = G::new("L.1", 5967);
-            g1.t("bf", bf)
-                .t(format!("N({n})==1"), n == 1)
-                .p("y&1==0", (ptr.y & 1) == 0)
-                .p("scalarOutputWindow", scalar_output_window);
-            let one = g1.passed();
-            tr.push(g1.step());
-            if one {
-                return Ok(Routed::new(
-                    tr,
-                    "L.1",
-                    5967,
-                    "tiny_row_stdev::SearchTinyRowSTDev3400000<bfloat16_t,bfloat16_t>",
-                    m,
-                    "<<<M>>>",
-                )
-                .with_pack(pack));
-            }
-            let kern = if bf {
-                "RowParallelTiny<bfloat16_t,bfloat16_t>"
-            } else {
-                "RowParallelTiny<float,half>"
-            };
-            return Ok(Routed::new(tr, "L", 5965, kern, m, "<<<M>>>").with_pack(pack));
-        }
-    }
-
-    // --- M: same family under a lower core budget (5976) ----------------------
-    {
-        let mut g = G::new("M", 5976);
-        g.t(format!("M({m})<=4"), m <= 4)
-            .c(format!("M>2*cores({})", 2 * cores64), u64::from(m) > 2 * cores64)
-            .t(format!("N({n})<=32"), n <= 32)
-            .t(format!("K({k})<=8"), k <= 8);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let blocks = u64::from(m).min(2 * cores64) as u32;
-            let kern = if bf {
-                "BudgetStridedRowTiny<bfloat16_t,bfloat16_t>"
-            } else {
-                "BudgetStridedRowTiny<float,half>"
-            };
-            return Ok(Routed::new(tr, "M", 5976, kern, blocks, "min(M, 2*cores)").with_pack(vec![
-                f("M-1", 0, 2, u64::from(m - 1), Some(3)),
-                f("N-1", 2, 5, u64::from(n - 1), Some(31)),
-                f("K-1", 7, 3, u64::from(k - 1), Some(7)),
-                f("E-1", 10, 7, u64::from(e - 1), Some(127)),
-                f("gt", 17, 1, u64::from(gt), Some(1)),
-            ]));
-        }
-    }
-
-    // --- N: TinyShortReduction fallback (5983) --------------------------------
-    {
-        let mut g = G::new("N", 5983);
-        g.t(format!("M*N({m_n})<=64"), m_n <= 64)
-            .t(format!("K({k})<=8"), k <= 8)
-            .t(format!("E({e})<=16"), e <= 16);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            return Ok(Routed::new(
-                tr,
-                "N",
-                5983,
-                &format!("TinyShortReduction<{bf}>"),
-                1,
-                "<<<1>>>",
-            )
-            .with_pack(vec![
-                f("M-1", 0, 6, u64::from(m - 1), Some(63)),
-                f("N-1", 6, 6, u64::from(n - 1), Some(63)),
-                f("K-1", 12, 3, u64::from(k - 1), Some(7)),
-                f("E-1", 15, 4, u64::from(e - 1), Some(15)),
-                f("gt", 19, 1, u64::from(gt), Some(1)),
-            ]));
-        }
-    }
-
-    // --- O: M==1, only K parallel (5988) --------------------------------------
-    {
-        let mut g = G::new("O", 5988);
-        g.t(format!("M({m})==1"), m == 1).t(format!("N({n})<=2"), n <= 2);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let blocks = (2 * cores64).min(u64::from(n)) as u32;
-            let kern = if bf {
-                "IntegerProductLongNarrowDot<bfloat16_t,bfloat16_t>"
-            } else {
-                "IntegerProductLongNarrowDot<float,half>"
-            };
-            let mut r = Routed::new(tr, "O", 5988, kern, blocks, "min(2*cores, N)");
-            r.notes.push("GeneralVectorDims passed by value -- no bit packing".into());
-            return Ok(r);
-        }
-    }
-
-    // --- P: N==1 matvec (5994) -------------------------------------------------
-    {
-        let mut g = G::new("P", 5994);
-        g.t(format!("N({n})==1"), n == 1);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let blocks = (2 * cores64).min(u64::from(m)) as u32;
-            if k <= 800 {
-                let kern = if bf {
-                    "SearchN1FixedLayoutSafe7100000<bfloat16_t,bfloat16_t,32,800>"
-                } else {
-                    "SearchN1FixedLayoutSafe7100000<float,half,32,800>"
-                };
-                let mut r = Routed::new(tr, "P", 5994, kern, blocks, "min(2*cores, M)");
-                r.notes.push(format!("K({k})<=800 (5997): 800 is the UB column capacity C"));
-                r.notes.push("GeneralVectorDims by value -- no bit packing; fixed UB 184672 B".into());
-                return Ok(r);
-            }
-            let kern = if bf { "RowDot<16,bfloat16_t,bfloat16_t>" } else { "RowDot<16,float,half>" };
-            let mut r = Routed::new(tr, "P.2", 6002, kern, blocks, "min(2*cores, M)");
-            r.notes.push(format!("K({k})>800 -> RowDot<16>"));
-            return Ok(r);
-        }
-    }
-
-    // --- Q: Plan p (6006) ------------------------------------------------------
-    let mut p = Plan {
-        m,
-        k,
-        n,
-        e,
-        list_type: gt,
-        kp: up(k, 32),
-        wstride: n,
-        cores: env.available_core_num,
-        vcores: env.available_core_num * 2,
-        ..Default::default()
-    };
-    tr.push(Step {
-        label: "Q".into(),
-        line: 6006,
-        outcome: Outcome::Note,
-        detail: format!(
-            "Plan p: kp=UpH(k,32)={} wstride=n={} cores={} vcores={}",
-            p.kp, p.wstride, p.cores, p.vcores
-        ),
-        deps: vec![Dep::Cores],
-    });
-
-    // --- R: K==1 outer product (6010) -----------------------------------------
-    {
-        let mut g = G::new("R", 6010);
-        g.t(format!("k({})==1", p.k), p.k == 1);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let selected_pitch = up(p.n, 16);
-            let selected_nup = up(p.n, 32);
-            let selected_ub = 32u64 * u64::from(selected_pitch) * 6
-                + 12 * u64::from(selected_nup)
-                + 80 * 32
-                + u64::from(selected_nup)
-                + 32
-                + 32
-                + 32;
-            let mut g1 = G::new("R.1", 6015);
-            g1.t("!bf", !bf)
-                .t(format!("m({})>=256", p.m), p.m >= 256)
-                .t(format!("n({})>=512", p.n), p.n >= 512)
-                .t(format!("n({})<=1024", p.n), p.n <= 1024)
-                .t(format!("selectedPitch/8({})<=255", selected_pitch / 8), selected_pitch / 8 <= 255)
-                .t(format!("selectedUb({selected_ub})<=188160"), selected_ub <= 188160);
-            let one = g1.passed();
-            tr.push(g1.step());
-            if one {
-                let core_num = p.vcores.min((p.m + 31) / 32 + p.e).min(16);
-                let vt = VTiling {
-                    m: p.m,
-                    k: p.k,
-                    n: p.n,
-                    e: p.e,
-                    list_type: p.list_type,
-                    core_num,
-                    kc: 32,
-                    nb: selected_pitch,
-                };
-                let mut r = Routed::new(
-                    tr,
-                    "R.1",
-                    6015,
-                    "p10_fixed_ub::SearchP10FixedUb7300000",
-                    core_num,
-                    "min(min(vcores, ceil(m/32)+e), 16)",
-                );
-                r.vtiling = Some(vt);
-                r.plan = Some(p);
-                r.notes.push(format!("selectedUb = {selected_ub} B"));
-                r.notes.push("VTiling by value -- no bit packing".into());
-                return Ok(r);
-            }
-            let mut g2 = G::new("R.2", 6025);
-            g2.t("!bf", !bf)
-                .t(format!("m({})>=256", p.m), p.m >= 256)
-                .t(format!("n({})>=512", p.n), p.n >= 512)
-                .t(format!("n({})<=1024", p.n), p.n <= 1024);
-            let two = g2.passed();
-            tr.push(g2.step());
-            if two {
-                let core_num = p.vcores.min((p.m + 19) / 20 + p.e);
-                let vt = VTiling {
-                    m: p.m,
-                    k: p.k,
-                    n: p.n,
-                    e: p.e,
-                    list_type: p.list_type,
-                    core_num,
-                    kc: 20,
-                    nb: up(p.n, 16),
-                };
-                let mut r = Routed::new(
-                    tr,
-                    "R.2",
-                    6025,
-                    "PublishedOuter",
-                    core_num,
-                    "min(vcores, ceil(m/20)+e)",
-                );
-                r.vtiling = Some(vt);
-                r.plan = Some(p);
-                return Ok(r);
-            }
-            tr.push(Step {
-                label: "R.3".into(),
-                line: 6032,
-                outcome: Outcome::Pass,
-                detail: "unconditional K==1 fallback: BuildOuterTiling + GmmOuterKernel".into(),
-                deps: vec![],
-            });
-            let vt = build_outer_tiling(&p);
-            let kern = if bf {
-                "GmmOuterKernel<bfloat16_t,bfloat16_t>"
-            } else {
-                "GmmOuterKernel<float,half>"
-            };
-            let mut r = Routed::new(tr, "R.3", 6032, kern, vt.core_num, "BuildOuterTiling.coreNum");
-            r.vtiling = Some(vt);
-            r.plan = Some(p);
-            r.notes.push(
-                "BuildOuterTiling (947) never checks ubBytes(1) <= 188160; its loop condition is \
-                 rows>1 [CURRENT.md landmine 7]"
-                    .into(),
-            );
-            return Ok(r);
-        }
-    }
-
-    // --- S: many short experts (6038) ------------------------------------------
-    {
-        let mut g = G::new("S", 6038);
-        g.t(format!("e({})>=32", p.e), p.e >= 32)
-            .t(format!("m({})<=256", p.m), p.m <= 256)
-            .t(format!("m({})<=2*e({})", p.m, 2 * p.e), p.m <= 2 * p.e)
-            .t(format!("k({})<=512", p.k), p.k <= 512)
-            .t(format!("n({})<=512", p.n), p.n <= 512);
-        let pass = g.passed();
-        tr.push(g.step());
-        if pass {
-            let vt = build_bosg(&p);
-            let kern = if bf {
-                "BalancedOverlapShortGroupMatmulKernel<bfloat16_t,bfloat16_t>"
-            } else {
-                "BalancedOverlapShortGroupMatmulKernel<float,half>"
-            };
-            let mut r = Routed::new(tr, "S", 6038, kern, vt.core_num, "min(vcores, m)");
-            r.notes.push(format!("nPitch = UpH(n,32) = {}", (p.n + 31) / 32 * 32));
-            r.notes.push("pure AIV; VTiling by value -- no bit packing".into());
-            r.vtiling = Some(vt);
-            r.plan = Some(p);
-            return Ok(r);
-        }
-    }
-
-    let rows_per_expert = p.m / p.e;
-
-    // --- T: medium short experts, FP16 scalar-half (6046) ----------------------
-    {
-        let mut g = G::new("T", 6046);
-        g.t("!bf", !bf)
-            .c(format!("cores({})<=20", p.cores), p.cores <= 20)
-            .t(format!("e({})>1", p.e), p.e > 1)
-            .t(format!("e({})<=16", p.e), p.e <= 16)
-            .t(format!("m/e({rows_per_expert})>=96"), rows_per_expert >= 96)
-            .t(format!("m/e({rows_per_expert})<256"), rows_per_expert < 256)
-            .t(format!("k({})>256", p.k), p.k > 256)
-            .t(format!("k({})<=512", p.k), p.k <= 512)
-            .t(format!("n({})>640", p.n), p.n > 640)
-            .t(format!("n({})<=1024", p.n), p.n <= 1024)
-            .t(
-                format!("(k%128({}) || n%128({}))", p.k % 128, p.n % 128),
-                p.k % 128 != 0 || p.n % 128 != 0,
-            );
-        let mut pass = g.passed();
-        let mut selected = p; // copy, not a reference
-        if pass {
-            let ok = configure_cube_full_k(&mut selected, 192, 128, 96, 128, true, false, env.l1_guard);
-            g.t("ConfigureCubeFullK<192,128,96,128,Prefetch,->", ok);
-            pass = ok;
-        }
-        tr.push(g.step());
-        if pass {
-            let mut r = Routed::new(
-                tr,
-                "T",
-                6046,
-                "SearchCubeCompact4700001<float,half>",
-                selected.cores,
-                "p.cores (not clamped to GetCoreNumAic)",
-            );
-            r.body = Some("CubeFullKBodyScalarHalf<float,half,192,128,96,128>".into());
-            r.staging = Some(staging_bytes(&selected) / 2);
-            r.plan = Some(selected);
-            return Ok(r.with_pack(vec![
-                f("k-1", 0, 9, u64::from(selected.k - 1), Some(511)),
-                f("n-1", 9, 10, u64::from(selected.n - 1), Some(1023)),
-                f("e-1", 19, 4, u64::from(selected.e - 1), Some(15)),
-                f("cores-1", 23, 5, u64::from(selected.cores - 1), Some(19)),
-                f("gt", 28, 1, u64::from(selected.list_type), Some(1)),
-            ]));
-        }
-    }
-
-    // --- U: aligned medium int32 backend (6055) --------------------------------
-    {
-        let mut g = G::new("U", 6055);
-        g.c(format!("cores({})<=20", p.cores), p.cores <= 20)
-            .t(format!("e({})>1", p.e), p.e > 1)
-            .t(format!("e({})<=16", p.e), p.e <= 16)
-            .t(format!("m/e({rows_per_expert})>=64"), rows_per_expert >= 64)
-            .t(format!("m/e({rows_per_expert})<256"), rows_per_expert < 256)
-            .t(format!("n({})>=384", p.n), p.n >= 384)
-            .t(format!("n({})<=640", p.n), p.n <= 640)
-            .t(format!("n%128({})==0", p.n % 128), p.n % 128 == 0)
-            .t(format!("k({})>=128", p.k), p.k >= 128)
-            .t(format!("k({})<=512", p.k), p.k <= 512)
-            .t(format!("k%128({})==0", p.k % 128), p.k % 128 == 0);
-        let mut pass = g.passed();
-        let mut selected = p;
-        if pass {
-            let ok = configure_cube_full_k(&mut selected, 64, 128, 128, 64, true, false, env.l1_guard);
-            g.t("ConfigureCubeFullK<64,128,128,64,Prefetch,->", ok);
-            pass = ok;
-        }
-        tr.push(g.step());
-        if pass {
-            let kern = if bf {
-                "SearchCubeCompact4700003<bfloat16_t,bfloat16_t>"
-            } else {
-                "SearchCubeCompact4700003<float,half>"
-            };
-            let mut r = Routed::new(
-                tr,
-                "U",
-                6055,
-                kern,
-                selected.cores,
-                "p.cores (not clamped to GetCoreNumAic)",
-            );
-            r.body = Some("CubeFullKBody<...,64,128,128,64,2u,true>".into());
-            r.staging = Some(staging_bytes(&selected));
-            r.plan = Some(selected);
-            return Ok(r.with_pack(vec![
-                f("k/128-1", 0, 2, u64::from(selected.k / 128 - 1), Some(3)),
-                f("n/128-1", 2, 3, u64::from(selected.n / 128 - 1), Some(4)),
-                f("e-1", 5, 4, u64::from(selected.e - 1), Some(15)),
-                f("cores-1", 9, 5, u64::from(selected.cores - 1), Some(19)),
-                f("gt", 14, 1, u64::from(selected.list_type), Some(1)),
-            ]));
-        }
-    }
-
-    // --- V: packWeights (6065), then V.1 (6070) / V.2 (6078) -------------------
-    let pack_l1_coeff: u64 = if rows_per_expert >= 512 { 464 } else { 480 };
-    let pack_weights = rows_per_expert >= 256
-        && p.n >= 512
-        && p.n % 32 != 0
-        && p.k >= 128
-        && pack_l1_coeff * u64::from(p.kp) <= L1_BYTES;
-    {
-        let mut g = G::new("V", 6065);
-        g.t(format!("m/e({rows_per_expert})>=256"), rows_per_expert >= 256)
-            .t(format!("n({})>=512", p.n), p.n >= 512)
-            .t(format!("n%32({})!=0", p.n % 32), p.n % 32 != 0)
-            .t(format!("k({})>=128", p.k), p.k >= 128)
-            .t(
-                format!("{pack_l1_coeff}*kp({})={}<=524288", p.kp, pack_l1_coeff * u64::from(p.kp)),
-                pack_l1_coeff * u64::from(p.kp) <= L1_BYTES,
-            );
-        let mut step = g.step();
-        step.outcome = Outcome::Note;
-        step.detail = if pack_weights {
-            format!("packWeights = true: {}", step.detail)
-        } else {
-            format!("packWeights = false, first failing term: {}", step.detail)
-        };
-        tr.push(step);
-    }
-    if pack_weights {
-        let mut packed = p;
-        packed.wstride = up(p.n, 128);
-        // V.1 -- bf16
-        {
-            let mut g = G::new("V.1", 6070);
-            g.t("bf", bf)
-                .c(format!("cores({})<=20", p.cores), p.cores <= 20)
-                .t(format!("e({})<=16", p.e), p.e <= 16)
-                .t(format!("m/e({rows_per_expert})<512"), rows_per_expert < 512)
-                .t(format!("k({})>512", p.k), p.k > 512)
-                .t(format!("k({})<=1024", p.k), p.k <= 1024)
-                .t(format!("n({})<=1280", p.n), p.n <= 1280)
-                .t(
-                    format!("480*kp({})={}<=524032", p.kp, 480 * u64::from(p.kp)),
-                    480 * u64::from(p.kp) <= 524032,
-                );
-            let mut pass = g.passed();
-            if pass {
-                let ok = configure_cube_full_k(&mut packed, 224, 128, 128, 64, true, false, env.l1_guard);
-                g.t("ConfigureCubeFullK<224,128,128,64,Prefetch,->", ok);
-                pass = ok;
-            }
-            tr.push(g.step());
-            if pass {
-                let mut r = Routed::new(
-                    tr,
-                    "V.1",
-                    6070,
-                    "SearchCubeCompact4700004<true>",
-                    packed.cores,
-                    "p.cores (not clamped to GetCoreNumAic)",
-                );
-                r.body = Some("PackActiveWeightRowsInline + CubeFullKUnitBody<...,224,128,128,64>".into());
-                r.staging = Some(staging_bytes(&packed));
-                r.extra_scratch = Some((
-                    "packedWeight = e*k*wstride".into(),
-                    u64::from(packed.e) * u64::from(packed.k) * u64::from(packed.wstride),
-                ));
-                r.plan = Some(packed);
-                r.notes.push(format!("packed.wstride = UpH(n,128) = {}", packed.wstride));
-                return Ok(r.with_pack(vec![
-                    f("k-1", 0, 10, u64::from(packed.k - 1), Some(1023)),
-                    f("n-1", 10, 11, u64::from(packed.n - 1), Some(1279)),
-                    f("e-1", 21, 4, u64::from(packed.e - 1), Some(15)),
-                    f("cores-1", 25, 5, u64::from(packed.cores - 1), Some(19)),
-                    f("gt", 30, 1, u64::from(packed.list_type), Some(1)),
-                ]));
-            }
-        }
-        // V.2 -- fp16. Note the term order: ConfigureCubeFullK comes *second*,
-        // before the e/cores/k/n bounds (6078..6080).
-        {
-            let mut g = G::new("V.2", 6078);
-            g.t("!bf", !bf);
-            let mut pass = g.passed();
-            if pass {
-                let ok = configure_cube_full_k(&mut packed, 224, 128, 128, 64, true, false, env.l1_guard);
-                g.t("ConfigureCubeFullK<224,128,128,64,Prefetch,->", ok);
-                pass = ok;
-            }
-            if pass {
-                g.t(format!("e({})<=16", p.e), p.e <= 16)
-                    .c(format!("cores({})<=20", p.cores), p.cores <= 20)
-                    .t(format!("k({})<=1024", p.k), p.k <= 1024)
-                    .t(format!("n({})<=1280", p.n), p.n <= 1280)
-                    .t(
-                        format!("480*kp({})={}<=524032", p.kp, 480 * u64::from(p.kp)),
-                        480 * u64::from(p.kp) <= 524032,
-                    );
-                pass = g.passed();
-            }
-            tr.push(g.step());
-            if pass {
-                let mut r = Routed::new(
-                    tr,
-                    "V.2",
-                    6078,
-                    "SearchCubeCompact4700005<false>",
-                    packed.cores,
-                    "p.cores (not clamped to GetCoreNumAic)",
-                );
-                r.body =
-                    Some("PackActiveWeightRowsInline + CubeFullKBodyScalarHalf<...,224,128,128,64>".into());
-                r.staging = Some(staging_bytes(&packed) / 2);
-                r.extra_scratch = Some((
-                    "packedWeight = e*k*wstride".into(),
-                    u64::from(packed.e) * u64::from(packed.k) * u64::from(packed.wstride),
-                ));
-                r.plan = Some(packed);
-                r.notes.push(format!("packed.wstride = UpH(n,128) = {}", packed.wstride));
-                return Ok(r.with_pack(vec![
-                    f("k-1", 0, 10, u64::from(packed.k - 1), Some(1023)),
-                    f("n-1", 10, 11, u64::from(packed.n - 1), Some(1279)),
-                    f("e-1", 21, 4, u64::from(packed.e - 1), Some(15)),
-                    f("cores-1", 25, 5, u64::from(packed.cores - 1), Some(19)),
-                    f("gt", 30, 1, u64::from(packed.list_type), Some(1)),
-                ]));
-            }
-        }
-    }
-
-    // --- W: narrow bf16, one K chunk (6088) ------------------------------------
-    {
-        let mut g = G::new("W", 6088);
-        g.t("bf", bf)
-            .c(format!("cores({})<=20", p.cores), p.cores <= 20)
-            .t(format!("e({})>1", p.e), p.e > 1)
-            .t(format!("e({})<=16", p.e), p.e <= 16)
-            .t(format!("m/e({rows_per_expert})>=96"), rows_per_expert >= 96)
-            .t(format!("m/e({rows_per_expert})<256"), rows_per_expert < 256)
-            .t(format!("n({})>=192", p.n), p.n >= 192)
-            .t(format!("n({})<=320", p.n), p.n <= 320)
-            .t(format!("k({})>256", p.k), p.k > 256)
-            .t(format!("k({})<=384", p.k), p.k <= 384);
-        let mut pass = g.passed();
-        let mut selected = p;
-        if pass {
-            let ok = configure_cube_full_k(&mut selected, 64, 128, 384, 32, true, true, env.l1_guard);
-            g.t("ConfigureCubeFullK<64,128,384,32,Prefetch,SingleL0>", ok);
-            pass = ok;
-        }
-        tr.push(g.step());
-        if pass {
-            let mut r = Routed::new(
-                tr,
-                "W",
-                6088,
-                "SearchCubeCompact4700002<bfloat16_t,bfloat16_t>",
-                selected.cores,
-                "p.cores (not clamped to GetCoreNumAic)",
-            );
-            r.body = Some("CubeFullKUnitBody<bf16,bf16,64,128,384,32>".into());
-            r.staging = Some(staging_bytes(&selected));
-            r.plan = Some(selected);
-            r.notes.push(
-                "LaunchNarrowSingleKSelected instantiates bf16 only (3670); relaxing W's leading \
-                 `bf &&` loses fp16 correctness with no compile error [CURRENT.md landmine 3]"
-                    .into(),
-            );
-            return Ok(r.with_pack(vec![
-                f("k-1", 0, 9, u64::from(selected.k - 1), Some(383)),
-                f("n-1", 9, 9, u64::from(selected.n - 1), Some(319)),
-                f("e-1", 18, 4, u64::from(selected.e - 1), Some(15)),
-                f("cores-1", 22, 5, u64::from(selected.cores - 1), Some(19)),
-                f("gt", 27, 1, u64::from(selected.list_type), Some(1)),
-            ]));
-        }
-    }
-
-    // --- X: resident expert/N panels, mix11 (6096) -----------------------------
-    // The one gate that passes `p` BY REFERENCE. Safe only because both
-    // `return false`s in ConfigureCubeFullK precede every write.
-    {
-        let mut g = G::new("X", 6096);
-        g.t(format!("rowsPerExpert({rows_per_expert})<96"), rows_per_expert < 96)
-            .t(format!("n({})<=640", p.n), p.n <= 640)
-            .t(format!("kp({})<=512", p.kp), p.kp <= 512);
-        let mut pass = g.passed();
-        if pass {
-            // by reference -- p itself is mutated
-            let ok = configure_cube_full_k(&mut p, 96, 128, 512, 48, false, true, env.l1_guard);
-            g.t("ConfigureCubeFullK<96,128,512,48,-,SingleL0>(p)  [p BY REFERENCE]", ok);
-            pass = ok;
-        }
-        tr.push(g.step());
-        if pass {
-            let clamped = p.cores.min(env.physical_aic);
-            if clamped == 0 {
-                return Err("mix11::Launch: no physical AIC cores (3001)".into());
-            }
-            let upper = (u64::from((p.m + 95) / 96) + u64::from(p.e) - 1)
-                * u64::from((p.n + 127) / 128);
-            let demote = clamped > 32 || upper > 4 * u64::from(clamped);
-            if !demote {
-                let mut q = p;
-                q.cores = clamped;
-                q.vcores = clamped; // 1:1 MIX (3003)
-                let kern = if bf {
-                    "mix11::SearchP2Mix115300000<bfloat16_t,bfloat16_t>"
-                } else {
-                    "mix11::SearchP2Mix115300000<float,half>"
-                };
-                let mut r = Routed::new(
-                    tr,
-                    "X",
-                    6096,
-                    kern,
-                    q.cores,
-                    "min(p.cores, GetCoreNumAic())",
-                );
-                r.body = Some("CubeFullKBody<...,96,128,256,96,...> (MIX_AIC_1_1)".into());
-                r.staging = Some(staging_bytes(&q));
-                r.plan = Some(q);
-                r.notes.push(format!(
-                    "mix11::Upper(p) = {upper} <= 4*cores = {} -> stays in mix11 (3002)",
-                    4 * clamped
-                ));
-                r.notes.push("p.vcores = p.cores (1:1 MIX), unlike the 2*cores everywhere else".into());
-                return Ok(r.with_pack(vec![
-                    f("k-1", 0, 9, u64::from(q.k - 1), Some(511)),
-                    f("n-1", 9, 10, u64::from(q.n - 1), Some(639)),
-                    f("e-1", 19, 7, u64::from(q.e - 1), Some(127)),
-                    f("cores-1", 26, 5, u64::from(q.cores - 1), Some(31)),
-                    f("gt", 31, 1, u64::from(q.list_type), Some(1)),
-                ]));
-            }
-            // packed32::LaunchPacked32 receives `incoming` -- the un-clamped Plan.
-            let mut q = p;
-            q.cores = p.cores.min(env.physical_aic);
-            q.vcores = q.cores * 2;
-            tr.push(Step {
-                label: "X.p32".into(),
-                line: 3002,
-                outcome: Outcome::Pass,
-                detail: format!(
-                    "cores({clamped})>32 || Upper({upper})>4*cores({}) -> packed32::LaunchPacked32",
-                    4 * clamped
-                ),
-                deps: vec![Dep::Cores],
-            });
-            if q.cores <= 32 {
-                let kern = if bf {
-                    "packed32::SearchP2Packed324300000<bfloat16_t,bfloat16_t>"
-                } else {
-                    "packed32::SearchP2Packed324300000<float,half>"
-                };
-                let mut r = Routed::new(tr, "X.p32", 2971, kern, q.cores, "min(p.cores, GetCoreNumAic())");
-                r.staging = Some(staging_bytes(&q));
-                r.plan = Some(q);
-                return Ok(r.with_pack(vec![
-                    f("k-1", 0, 9, u64::from(q.k - 1), Some(511)),
-                    f("n-1", 9, 10, u64::from(q.n - 1), Some(639)),
-                    f("e-1", 19, 7, u64::from(q.e - 1), Some(127)),
-                    f("cores-1", 26, 5, u64::from(q.cores - 1), Some(31)),
-                    f("gt", 31, 1, u64::from(q.list_type), Some(1)),
-                ]));
-            }
-            let kern = if bf {
-                "packed32::SearchP2Fixed964100000<bfloat16_t,bfloat16_t>"
-            } else {
-                "packed32::SearchP2Fixed964100000<float,half>"
-            };
-            let mut r = Routed::new(tr, "X.f96", 2975, kern, q.cores, "min(p.cores, GetCoreNumAic())");
-            r.staging = Some(staging_bytes(&q));
-            r.plan = Some(q);
-            r.notes.push("Plan by value -- no bit packing on this arm".into());
-            return Ok(r);
-        }
-    }
-
-    // --- Y: aligned FP16 full-K, half-pair output (6103) -----------------------
-    {
-        let mut g = G::new("Y", 6103);
-        g.t("!bf", !bf)
-            .c(format!("availableCoreNum({})<=20", env.available_core_num), env.available_core_num <= 20)
-            .t(format!("rowsPerExpert({rows_per_expert})>=256"), rows_per_expert >= 256)
-            .t(format!("n({})>=512", p.n), p.n >= 512)
-            .t(format!("n%128({})==0", p.n % 128), p.n % 128 == 0)
-            .t(format!("k%128({})==0", p.k % 128), p.k % 128 == 0)
-            .t(format!("wstride({})==n({})", p.wstride, p.n), p.wstride == p.n);
-        if env.l1_guard {
-            g.t(
-                format!("512*kp({})={}<=524032", p.kp, 512 * u64::from(p.kp)),
-                512 * u64::from(p.kp) <= 524032,
-            );
-        } else {
-            g.t("512*kp<=524032  [L1 GUARDS DISABLED by --no-l1-guard]", true);
-        }
-        let mut pass = g.passed();
-        let mut selected = p;
-        if pass {
-            let ok = configure_cube_full_k(&mut selected, 256, 128, 128, 64, true, false, env.l1_guard);
-            g.t("ConfigureCubeFullK<256,128,128,64,Prefetch,->", ok);
-            pass = ok;
-        }
-        tr.push(g.step());
-        if pass {
-            let mut r = Routed::new(
-                tr,
-                "Y",
-                6103,
-                "p1_half_pair::SearchP1HalfPairOutput11840034<float,half>",
-                selected.cores,
-                "p.cores (not clamped to GetCoreNumAic)",
-            );
-            r.body = Some("CubeFullKUnitBodyScalarHalf<float,half,256,128,128,64>".into());
-            r.staging = Some(staging_bytes(&selected) / 2);
-            r.plan = Some(selected);
-            // The landmine: the field holds k<=1024 but gate Y bounds k only
-            // incidentally, through the L1 budget line at 6105.
-            let mut kf = f("k/128-1", 0, 3, u64::from(selected.k / 128 - 1), if env.l1_guard { Some(6) } else { None });
-            kf.incidental = Some(
-                "gate Y has no explicit upper bound on k; only the two L1 budget checks -- \
-                 512*kp<=524032 (6105) and ConfigureCubeFullK's (256+2*128)*kp<=512K (2863) -- \
-                 keep it <= 896. Rewrite that arithmetic and k=1152 aliases to k=128, a silent \
-                 wrong answer [CURRENT.md landmine 1, which names only 6105]",
-            );
-            r.notes.push("staging = CubeFullKStagingBytes(p)/2 (half-precision backend, 4217)".into());
-            return Ok(r.with_pack(vec![
-                kf,
-                f("n/128-1", 3, 6, u64::from(selected.n / 128 - 1), Some(63)),
-                f("e-1", 9, 7, u64::from(selected.e - 1), Some(127)),
-                f("cores-1", 16, 5, u64::from(selected.cores - 1), Some(19)),
-                f("gt", 21, 1, u64::from(selected.list_type), Some(1)),
-            ]));
         }
     }
 
@@ -1755,6 +704,702 @@ pub fn route(s: &Shape, env: &Env) -> Result<Routed, String> {
         .push("Plan by value, no bit packing -- Z cannot overflow a dims field".into());
     r.notes.push("correct for any new shape, but 2-5x slower than the specialized families".into());
     Ok(r)
+}
+
+/// One top-level gate. `None` means it did not fire and the walk continues.
+///
+/// Everything in here is what a table *cannot* express: which kernel symbol the
+/// arm launches, what its grid is, how much GM scratch it allocates, and the
+/// sub-dispatch that happens in another fragment (the two capacity `Select`
+/// ladders, `mix11::Launch`'s demotion to `packed32`).
+fn try_gate(
+    nodes: &[Node],
+    gate: &Gate,
+    ctx: &Ctx,
+    p: &mut Plan,
+    tr: &mut Vec<Step>,
+) -> Option<Result<Routed, String>> {
+    let s = &ctx.shape;
+    let env = &ctx.env;
+    let (m, k, n, e) = (s.m, s.k, s.n, s.e);
+    let bf = s.bf;
+    let cores64 = u64::from(env.available_core_num);
+    let mut scratch = Plan::default();
+    let inner = |label: &str| -> &Gate {
+        cascade::find(nodes, label).unwrap_or_else(|| panic!("cascade has no gate {label:?}"))
+    };
+    let pack = |label: &str| cascade::pack_fields(nodes, label, ctx);
+
+    // The `Plan` this gate's `ConfigureCubeFullK` writes: a fresh copy, except
+    // for gate X, which configures the caller's `p` by reference.
+    let mut selected = *p;
+    let by_ref = gate.cfg().is_some_and(|c| c.target == "p");
+    let before = *p;
+    let (ok, step) = if by_ref {
+        eval_gate(gate, ctx, p)
+    } else {
+        eval_gate(gate, ctx, &mut selected)
+    };
+    tr.push(step);
+    if by_ref && !ok {
+        debug_assert_eq!(*p, before, "a failed by-reference gate must not write the outer Plan");
+    }
+    if !ok {
+        return None;
+    }
+
+    Some(Ok(match gate.label {
+        // --- B (5845) --------------------------------------------------------
+        "B" => Routed::new(
+            tr.clone(),
+            "B",
+            gate.line,
+            &format!("TinyShortReduction<{bf}>"),
+            1,
+            "<<<1>>>",
+        )
+        .with_pack(pack("B")),
+
+        // --- D (5858) --------------------------------------------------------
+        "D" => {
+            let fields = pack("D");
+            let row_dims = pack_value(&fields);
+            let mut r = Routed::new(
+                tr.clone(),
+                "D",
+                gate.line,
+                "expert_output::SearchTinyExpertOutput6400000<float,half>",
+                e,
+                "<<<E>>>",
+            )
+            .with_pack(fields);
+            r.notes.push(format!("rowDims = {row_dims}"));
+            r.notes.push("AIV path: launches asynchronously, no aclrtSynchronizeStream".into());
+            r
+        }
+
+        // --- E (5871), with E' and E'' ---------------------------------------
+        "E" => {
+            let fields = pack("E");
+            let dims = pack_value(&fields);
+            let (contract, step) = eval_gate(inner("E'"), ctx, &mut scratch);
+            tr.push(step);
+            // The Select ladders decode from `dims`, so they see truncated m/k/n.
+            let dm = (dims & 3) as u32 + 1;
+            let dk = ((dims >> 2) & 7) as u32 + 1;
+            let dn = ((dims >> 5) & 3) as u32 + 1;
+            if contract {
+                let mut r = match contract_select(dm, dk, dn, bf) {
+                    Some((cm, ck, cn)) => Routed::new(
+                        tr.clone(),
+                        "E'",
+                        5876,
+                        &format!(
+                            "tiny_capacity_contract::SearchTinyCapacityContract11850017<{bf},{cm},{ck},{cn}>"
+                        ),
+                        1,
+                        "<<<1>>>",
+                    ),
+                    None => {
+                        let mut r = Routed::new(tr.clone(), "E'", 5876, "tiny_capacity_contract::Select -- no arm", 0, "none");
+                        r.errors.push(format!(
+                            "tiny_capacity_contract::Select (5546) has no arm for (m={dm},k={dk},n={dn},bf={bf}); \
+                             it throws std::invalid_argument at 5727 -> RE"
+                        ));
+                        r
+                    }
+                }
+                .with_pack(fields);
+                r.notes.push(format!("dims = {dims}; Select decodes m={dm} k={dk} n={dn}"));
+                return Some(Ok(r));
+            }
+            let mut r = match unrolled_select(dk, dn, bf) {
+                Some((ck, cn)) => Routed::new(
+                    tr.clone(),
+                    "E''",
+                    5882,
+                    &format!(
+                        "tiny_capacity_unrolled::SearchTinyCapacityUnrolled11850012<{bf},{ck},{cn}>"
+                    ),
+                    1,
+                    "<<<1>>>",
+                ),
+                None => {
+                    let mut r = Routed::new(tr.clone(), "E''", 5882, "tiny_capacity_unrolled::Select -- no arm", 0, "none");
+                    r.errors.push(format!(
+                        "tiny_capacity_unrolled::Select (5337) has no arm for (k={dk},n={dn},bf={bf}); \
+                         it throws std::invalid_argument at 5414 -> RE"
+                    ));
+                    r
+                }
+            }
+            .with_pack(fields);
+            r.notes.push(format!("dims = {dims}; Select decodes k={dk} n={dn}"));
+            r
+        }
+
+        // --- F (5888), with the K ladder -------------------------------------
+        "F" => {
+            let scalar = ctx.scalar;
+            // The capacity comes from the ladder arm's own predicate, so the
+            // 1024/2048/4096/8192 staircase exists once, in the table.
+            let mut cap: Option<u64> = None;
+            for arm in &gate.inner {
+                let (hit, step) = eval_gate(arm, ctx, &mut scratch);
+                tr.push(step);
+                if hit {
+                    cap = arm.pred.iter().find_map(|t| match t {
+                        Expr::Cmp(Q::K, Op::Le, R::Const(v)) => Some(*v),
+                        _ => None,
+                    });
+                    break;
+                }
+            }
+            let cap = cap.expect("gate F bounds K<=8192, so some ladder arm must fire");
+            // longdot_capacity::Launch (3635): fp16 with misaligned scales takes
+            // the DMA variant; bf16 has no DMA variant.
+            let ptr = &env.ptrs;
+            let dma = !bf && ((ptr.x_scale | ptr.w_scale) & 3) != 0;
+            let kernel = if dma {
+                format!("longdot_capacity::SearchLongDotCapacityDMAScales<{cap},{scalar}>")
+            } else {
+                format!("longdot_capacity::SearchLongDotCapacity11840033<{cap},{bf},{scalar}>")
+            };
+            let mut r = Routed::new(tr.clone(), "F", gate.line, &kernel, 2, "<<<2>>>");
+            r.notes.push(format!(
+                "K ladder: K={k} -> Capacity={cap}; scalar={scalar} (y&31==0 && scalarOutputWindow)"
+            ));
+            if dma {
+                r.notes.push("DMA-scales variant chosen: (xScale|weightScale)&3 != 0".into());
+            } else if !bf {
+                r.notes
+                    .push("scalar-scales variant: (xScale|weightScale)&3 == 0 [pointer-dependent]".into());
+            }
+            r.notes.push("K is a runtime argument, not packed -- no bit fields".into());
+            r
+        }
+
+        // --- H (5919) --------------------------------------------------------
+        "H" => {
+            let kern = if bf {
+                "SearchTinyE1STDev3400000<bfloat16_t,bfloat16_t>"
+            } else {
+                "SearchTinyE1STDev3400000<float,half>"
+            };
+            let mut r =
+                Routed::new(tr.clone(), "H", gate.line, kern, m, "<<<M>>>").with_pack(pack("H"));
+            r.notes.push(
+                "rowDims omits the E field (5923) while the decoder reads bits 10..16 (4957); \
+                 correct only because H requires E==1 [CURRENT.md landmine 6]"
+                    .into(),
+            );
+            r
+        }
+
+        // --- I (5928) --------------------------------------------------------
+        "I" => {
+            let kern = if bf {
+                "E1FixedUbRowTiny<bfloat16_t,bfloat16_t>"
+            } else {
+                "E1FixedUbRowTiny<float,half>"
+            };
+            Routed::new(tr.clone(), "I", gate.line, kern, m, "<<<M>>>").with_pack(pack("I"))
+        }
+
+        // --- J (5937) --------------------------------------------------------
+        "J" => {
+            let mut r = Routed::new(
+                tr.clone(),
+                "J",
+                gate.line,
+                &format!("TinyCacheReduction<{bf}>"),
+                1,
+                "<<<1>>>",
+            )
+            .with_pack(pack("J"));
+            r.notes.push(
+                "tinyCacheDims packs M-1 in 4 bits and E-1 in 3 bits (5940); both overflows are \
+                 blocked only by unrelated clauses [CURRENT.md landmine 6]"
+                    .into(),
+            );
+            r
+        }
+
+        // --- K (5949), with K.1 / K.2 ----------------------------------------
+        "K" => {
+            let fields = pack("K");
+            let (two_by_two, step) = eval_gate(inner("K.2x2"), ctx, &mut scratch);
+            tr.push(step);
+            if two_by_two {
+                let (one, step) = eval_gate(inner("K.1"), ctx, &mut scratch);
+                tr.push(step);
+                if one {
+                    return Some(Ok(Routed::new(
+                        tr.clone(),
+                        "K.1",
+                        5951,
+                        "expert_output::SearchTinyExpertOutput6400000<float,half>",
+                        e,
+                        "<<<E>>>",
+                    )
+                    .with_pack(fields)));
+                }
+                let kern = if bf {
+                    "expert_reuse::SearchTinyExpertReuse6300000<bfloat16_t,bfloat16_t>"
+                } else {
+                    "expert_reuse::SearchTinyExpertReuse6300000<float,half>"
+                };
+                return Some(Ok(
+                    Routed::new(tr.clone(), "K.2", 5956, kern, e, "<<<E>>>").with_pack(fields)
+                ));
+            }
+            let kern = if bf {
+                "SearchTinyExpert3500000<bfloat16_t,bfloat16_t>"
+            } else {
+                "SearchTinyExpert3500000<float,half>"
+            };
+            Routed::new(tr.clone(), "K", gate.line, kern, e, "<<<E>>>").with_pack(fields)
+        }
+
+        // --- L (5965), with L.1 ----------------------------------------------
+        "L" => {
+            let fields = pack("L");
+            let (one, step) = eval_gate(inner("L.1"), ctx, &mut scratch);
+            tr.push(step);
+            if one {
+                return Some(Ok(Routed::new(
+                    tr.clone(),
+                    "L.1",
+                    5967,
+                    "tiny_row_stdev::SearchTinyRowSTDev3400000<bfloat16_t,bfloat16_t>",
+                    m,
+                    "<<<M>>>",
+                )
+                .with_pack(fields)));
+            }
+            let kern = if bf {
+                "RowParallelTiny<bfloat16_t,bfloat16_t>"
+            } else {
+                "RowParallelTiny<float,half>"
+            };
+            Routed::new(tr.clone(), "L", gate.line, kern, m, "<<<M>>>").with_pack(fields)
+        }
+
+        // --- M (5976) --------------------------------------------------------
+        "M" => {
+            let blocks = u64::from(m).min(2 * cores64) as u32;
+            let kern = if bf {
+                "BudgetStridedRowTiny<bfloat16_t,bfloat16_t>"
+            } else {
+                "BudgetStridedRowTiny<float,half>"
+            };
+            Routed::new(tr.clone(), "M", gate.line, kern, blocks, "min(M, 2*cores)")
+                .with_pack(pack("M"))
+        }
+
+        // --- N (5983) --------------------------------------------------------
+        "N" => Routed::new(
+            tr.clone(),
+            "N",
+            gate.line,
+            &format!("TinyShortReduction<{bf}>"),
+            1,
+            "<<<1>>>",
+        )
+        .with_pack(pack("N")),
+
+        // --- O (5988) --------------------------------------------------------
+        "O" => {
+            let blocks = (2 * cores64).min(u64::from(n)) as u32;
+            let kern = if bf {
+                "IntegerProductLongNarrowDot<bfloat16_t,bfloat16_t>"
+            } else {
+                "IntegerProductLongNarrowDot<float,half>"
+            };
+            let mut r = Routed::new(tr.clone(), "O", gate.line, kern, blocks, "min(2*cores, N)");
+            r.notes.push("GeneralVectorDims passed by value -- no bit packing".into());
+            r
+        }
+
+        // --- P (5994), with P.1 / P.2 ----------------------------------------
+        "P" => {
+            let blocks = (2 * cores64).min(u64::from(m)) as u32;
+            let (small_k, step) = eval_gate(inner("P.k800"), ctx, &mut scratch);
+            tr.push(step);
+            if small_k {
+                let kern = if bf {
+                    "SearchN1FixedLayoutSafe7100000<bfloat16_t,bfloat16_t,32,800>"
+                } else {
+                    "SearchN1FixedLayoutSafe7100000<float,half,32,800>"
+                };
+                let mut r =
+                    Routed::new(tr.clone(), "P", gate.line, kern, blocks, "min(2*cores, M)");
+                r.notes.push(format!("K({k})<=800 (5997): 800 is the UB column capacity C"));
+                r.notes.push("GeneralVectorDims by value -- no bit packing; fixed UB 184672 B".into());
+                return Some(Ok(r));
+            }
+            let kern = if bf { "RowDot<16,bfloat16_t,bfloat16_t>" } else { "RowDot<16,float,half>" };
+            let mut r = Routed::new(tr.clone(), "P.2", 6002, kern, blocks, "min(2*cores, M)");
+            r.notes.push(format!("K({k})>800 -> RowDot<16>"));
+            r
+        }
+
+        // --- R: K==1 outer product (6010) ------------------------------------
+        "R" => {
+            let (one, step) = eval_gate(inner("R.1"), ctx, &mut scratch);
+            tr.push(step);
+            if one {
+                let core_num = p.vcores.min((p.m + 31) / 32 + p.e).min(16);
+                let vt = VTiling {
+                    m: p.m,
+                    k: p.k,
+                    n: p.n,
+                    e: p.e,
+                    list_type: p.list_type,
+                    core_num,
+                    kc: 32,
+                    nb: ctx.selected_pitch,
+                };
+                let mut r = Routed::new(
+                    tr.clone(),
+                    "R.1",
+                    6015,
+                    "p10_fixed_ub::SearchP10FixedUb7300000",
+                    core_num,
+                    "min(min(vcores, ceil(m/32)+e), 16)",
+                );
+                r.vtiling = Some(vt);
+                r.plan = Some(*p);
+                r.notes.push(format!("selectedUb = {} B", ctx.selected_ub));
+                r.notes.push("VTiling by value -- no bit packing".into());
+                return Some(Ok(r));
+            }
+            let (two, step) = eval_gate(inner("R.2"), ctx, &mut scratch);
+            tr.push(step);
+            if two {
+                let core_num = p.vcores.min((p.m + 19) / 20 + p.e);
+                let vt = VTiling {
+                    m: p.m,
+                    k: p.k,
+                    n: p.n,
+                    e: p.e,
+                    list_type: p.list_type,
+                    core_num,
+                    kc: 20,
+                    nb: up(p.n, 16),
+                };
+                let mut r = Routed::new(
+                    tr.clone(),
+                    "R.2",
+                    6025,
+                    "PublishedOuter",
+                    core_num,
+                    "min(vcores, ceil(m/20)+e)",
+                );
+                r.vtiling = Some(vt);
+                r.plan = Some(*p);
+                return Some(Ok(r));
+            }
+            let (_, step) = eval_gate(inner("R.3"), ctx, &mut scratch);
+            tr.push(step);
+            let vt = build_outer_tiling(p);
+            let kern = if bf {
+                "GmmOuterKernel<bfloat16_t,bfloat16_t>"
+            } else {
+                "GmmOuterKernel<float,half>"
+            };
+            let mut r =
+                Routed::new(tr.clone(), "R.3", 6032, kern, vt.core_num, "BuildOuterTiling.coreNum");
+            r.vtiling = Some(vt);
+            r.plan = Some(*p);
+            r.notes.push(
+                "BuildOuterTiling (947) never checks ubBytes(1) <= 188160; its loop condition is \
+                 rows>1 [CURRENT.md landmine 7]"
+                    .into(),
+            );
+            r
+        }
+
+        // --- S (6038) --------------------------------------------------------
+        "S" => {
+            let vt = build_bosg(p);
+            let kern = if bf {
+                "BalancedOverlapShortGroupMatmulKernel<bfloat16_t,bfloat16_t>"
+            } else {
+                "BalancedOverlapShortGroupMatmulKernel<float,half>"
+            };
+            let mut r = Routed::new(tr.clone(), "S", gate.line, kern, vt.core_num, "min(vcores, m)");
+            r.notes.push(format!("nPitch = UpH(n,32) = {}", (p.n + 31) / 32 * 32));
+            r.notes.push("pure AIV; VTiling by value -- no bit packing".into());
+            r.vtiling = Some(vt);
+            r.plan = Some(*p);
+            r
+        }
+
+        // --- T (6046) --------------------------------------------------------
+        "T" => {
+            let mut r = Routed::new(
+                tr.clone(),
+                "T",
+                gate.line,
+                "SearchCubeCompact4700001<float,half>",
+                selected.cores,
+                "p.cores (not clamped to GetCoreNumAic)",
+            );
+            r.body = Some(cfg_body(gate, "CubeFullKBodyScalarHalf<float,half>"));
+            r.staging = Some(staging_bytes(&selected) / 2);
+            r.plan = Some(selected);
+            r.with_pack(pack("T"))
+        }
+
+        // --- U (6055) --------------------------------------------------------
+        "U" => {
+            let kern = if bf {
+                "SearchCubeCompact4700003<bfloat16_t,bfloat16_t>"
+            } else {
+                "SearchCubeCompact4700003<float,half>"
+            };
+            let mut r = Routed::new(
+                tr.clone(),
+                "U",
+                gate.line,
+                kern,
+                selected.cores,
+                "p.cores (not clamped to GetCoreNumAic)",
+            );
+            r.body = Some(format!("{}, 2u, true", cfg_body(gate, "CubeFullKBody<...>")));
+            r.staging = Some(staging_bytes(&selected));
+            r.plan = Some(selected);
+            r.with_pack(pack("U"))
+        }
+
+        // --- V (6067), with V.1 / V.2 ----------------------------------------
+        "V" => {
+            let mut packed = *p;
+            packed.wstride = up(p.n, 128);
+            let v1 = inner("V.1");
+            let (one, step) = eval_gate(v1, ctx, &mut packed);
+            tr.push(step);
+            if one {
+                let mut r = Routed::new(
+                    tr.clone(),
+                    "V.1",
+                    v1.line,
+                    "SearchCubeCompact4700004<true>",
+                    packed.cores,
+                    "p.cores (not clamped to GetCoreNumAic)",
+                );
+                r.body = Some(format!(
+                    "PackActiveWeightRowsInline + {}",
+                    cfg_body(v1, "CubeFullKUnitBody<...>")
+                ));
+                r.staging = Some(staging_bytes(&packed));
+                r.extra_scratch = Some((
+                    "packedWeight = e*k*wstride".into(),
+                    u64::from(packed.e) * u64::from(packed.k) * u64::from(packed.wstride),
+                ));
+                r.plan = Some(packed);
+                r.notes.push(format!("packed.wstride = UpH(n,128) = {}", packed.wstride));
+                return Some(Ok(r.with_pack(pack("V.1"))));
+            }
+            let v2 = inner("V.2");
+            let (two, step) = eval_gate(v2, ctx, &mut packed);
+            tr.push(step);
+            if !two {
+                // V's block falls through to W/X/Y, like any other failed arm.
+                return None;
+            }
+            let mut r = Routed::new(
+                tr.clone(),
+                "V.2",
+                v2.line,
+                "SearchCubeCompact4700005<false>",
+                packed.cores,
+                "p.cores (not clamped to GetCoreNumAic)",
+            );
+            r.body = Some(format!(
+                "PackActiveWeightRowsInline + {}",
+                cfg_body(v2, "CubeFullKBodyScalarHalf<...>")
+            ));
+            r.staging = Some(staging_bytes(&packed) / 2);
+            r.extra_scratch = Some((
+                "packedWeight = e*k*wstride".into(),
+                u64::from(packed.e) * u64::from(packed.k) * u64::from(packed.wstride),
+            ));
+            r.plan = Some(packed);
+            r.notes.push(format!("packed.wstride = UpH(n,128) = {}", packed.wstride));
+            r.with_pack(pack("V.2"))
+        }
+
+        // --- W (6088) --------------------------------------------------------
+        "W" => {
+            let mut r = Routed::new(
+                tr.clone(),
+                "W",
+                gate.line,
+                "SearchCubeCompact4700002<bfloat16_t,bfloat16_t>",
+                selected.cores,
+                "p.cores (not clamped to GetCoreNumAic)",
+            );
+            r.body = Some(cfg_body(gate, "CubeFullKUnitBody<bf16,bf16>"));
+            r.staging = Some(staging_bytes(&selected));
+            r.plan = Some(selected);
+            r.notes.push(
+                "LaunchNarrowSingleKSelected instantiates bf16 only (3670); relaxing W's leading \
+                 `bf &&` loses fp16 correctness with no compile error [CURRENT.md landmine 3]"
+                    .into(),
+            );
+            r.with_pack(pack("W"))
+        }
+
+        // --- X (6096): `p` was configured BY REFERENCE ------------------------
+        "X" => {
+            let clamped = p.cores.min(env.physical_aic);
+            if clamped == 0 {
+                return Some(Err("mix11::Launch: no physical AIC cores (3001)".into()));
+            }
+            let upper =
+                (u64::from((p.m + 95) / 96) + u64::from(p.e) - 1) * u64::from((p.n + 127) / 128);
+            let demote = clamped > 32 || upper > 4 * u64::from(clamped);
+            if !demote {
+                let mut q = *p;
+                q.cores = clamped;
+                q.vcores = clamped; // 1:1 MIX (3003)
+                let kern = if bf {
+                    "mix11::SearchP2Mix115300000<bfloat16_t,bfloat16_t>"
+                } else {
+                    "mix11::SearchP2Mix115300000<float,half>"
+                };
+                let mut r = Routed::new(
+                    tr.clone(),
+                    "X",
+                    gate.line,
+                    kern,
+                    q.cores,
+                    "min(p.cores, GetCoreNumAic())",
+                );
+                r.body = Some("CubeFullKBody<...,96,128,256,96,...> (MIX_AIC_1_1)".into());
+                r.staging = Some(staging_bytes(&q));
+                r.plan = Some(q);
+                r.notes.push(format!(
+                    "mix11::Upper(p) = {upper} <= 4*cores = {} -> stays in mix11 (3002)",
+                    4 * clamped
+                ));
+                r.notes.push("p.vcores = p.cores (1:1 MIX), unlike the 2*cores everywhere else".into());
+                return Some(Ok(r.with_pack(pack("X"))));
+            }
+            // packed32::LaunchPacked32 receives `incoming` -- the un-clamped Plan.
+            let mut q = *p;
+            q.cores = clamped;
+            q.vcores = q.cores * 2;
+            tr.push(Step {
+                label: "X.p32".into(),
+                line: 3002,
+                outcome: Outcome::Pass,
+                detail: format!(
+                    "cores({clamped})>32 || Upper({upper})>4*cores({}) -> packed32::LaunchPacked32",
+                    4 * clamped
+                ),
+                deps: vec![Dep::Cores],
+            });
+            if q.cores <= 32 {
+                let kern = if bf {
+                    "packed32::SearchP2Packed324300000<bfloat16_t,bfloat16_t>"
+                } else {
+                    "packed32::SearchP2Packed324300000<float,half>"
+                };
+                let mut r = Routed::new(
+                    tr.clone(),
+                    "X.p32",
+                    2971,
+                    kern,
+                    q.cores,
+                    "min(p.cores, GetCoreNumAic())",
+                );
+                r.staging = Some(staging_bytes(&q));
+                r.plan = Some(q);
+                return Some(Ok(r.with_pack(pack("X"))));
+            }
+            let kern = if bf {
+                "packed32::SearchP2Fixed964100000<bfloat16_t,bfloat16_t>"
+            } else {
+                "packed32::SearchP2Fixed964100000<float,half>"
+            };
+            let mut r =
+                Routed::new(tr.clone(), "X.f96", 2975, kern, q.cores, "min(p.cores, GetCoreNumAic())");
+            r.staging = Some(staging_bytes(&q));
+            r.plan = Some(q);
+            r.notes.push("Plan by value -- no bit packing on this arm".into());
+            r
+        }
+
+        // --- Y (6103) --------------------------------------------------------
+        "Y" => {
+            let mut r = Routed::new(
+                tr.clone(),
+                "Y",
+                gate.line,
+                "p1_half_pair::SearchP1HalfPairOutput11840034<float,half>",
+                selected.cores,
+                "p.cores (not clamped to GetCoreNumAic)",
+            );
+            r.body = Some(cfg_body(gate, "CubeFullKUnitBodyScalarHalf<float,half>"));
+            r.staging = Some(staging_bytes(&selected) / 2);
+            r.plan = Some(selected);
+            r.notes.push("staging = CubeFullKStagingBytes(p)/2 (half-precision backend, 4217)".into());
+            r.with_pack(pack("Y"))
+        }
+
+        // --- a gate the table has but this evaluator has no bespoke arm for ---
+        _ => generic_arm(nodes, gate, ctx, &selected, tr),
+    }))
+}
+
+/// The arm for a gate added as data -- a `--what-if` candidate, or a new gate
+/// pasted into `cascade()` on 14 November.
+///
+/// Everything it reports comes from the table: the launcher name from the
+/// gate's `Packer`, the tiling from its `ConfigureCubeFullK` term, the packed
+/// fields and their admitted maxima from its own predicate. A new cube gate
+/// therefore needs no Rust here at all; one that wants a different *grid* or a
+/// second `Scratch` does, and the note says so.
+fn generic_arm(
+    nodes: &[Node],
+    gate: &Gate,
+    ctx: &Ctx,
+    selected: &Plan,
+    tr: &mut Vec<Step>,
+) -> Routed {
+    let launcher = gate.pack.map(|p| p.launcher).unwrap_or("<no launcher in the table>");
+    let mut r = Routed::new(
+        tr.clone(),
+        gate.label,
+        gate.line,
+        launcher,
+        selected.cores,
+        "p.cores (generic arm: not clamped to GetCoreNumAic)",
+    );
+    if gate.cfg().is_some() {
+        r.body = Some(cfg_body(gate, "CubeFullK*"));
+        r.staging = Some(staging_bytes(selected));
+    }
+    r.plan = Some(*selected);
+    r.notes.push(
+        "generic arm: grid, dtype split and extra Scratch allocations are not table data -- \
+         check them against the launcher before trusting the timing"
+            .into(),
+    );
+    r.with_pack(cascade::pack_fields(nodes, gate.label, ctx))
+}
+
+/// `Name<...,BM,BN,BK,RV>` spelled from the gate's own `ConfigureCubeFullK`
+/// template arguments, so the reported body cannot name a tile the gate does
+/// not configure.
+fn cfg_body(gate: &Gate, name: &str) -> String {
+    match gate.cfg() {
+        Some(Cfg { bm, bn, bk, rv, .. }) => format!("{name},{bm},{bn},{bk},{rv}"),
+        None => name.to_string(),
+    }
 }
 
 /// `tiny_capacity_unrolled::Select` (5337). `None` == the terminating
@@ -1916,7 +1561,7 @@ mod tests {
     /// `gen/CURRENT.md`'s 15-point routing table, verbatim. If this ever fails,
     /// the discrepancy is a transcription bug here or an error in CURRENT.md --
     /// say which, do not edit the expectation.
-    const TABLE: &[(u32, &str, u32, &str, u32)] = &[
+    pub const TABLE: &[(u32, &str, u32, &str, u32)] = &[
         (1, "Y", 6103, "p1_half_pair::SearchP1HalfPairOutput11840034<float,half>", 20),
         (2, "X", 6096, "mix11::SearchP2Mix115300000<bfloat16_t,bfloat16_t>", 20),
         (3, "D", 5858, "expert_output::SearchTinyExpertOutput6400000<float,half>", 2),
@@ -1972,7 +1617,8 @@ mod tests {
             let r = route(&pts[idx].shape, &env).unwrap();
             assert_eq!(r.plan.unwrap().wstride, 1152, "point {point} wstride");
         }
-        // Point 3's rowDims, as CURRENT.md states it.
+        // Point 3's rowDims, as CURRENT.md states it -- now computed from the
+        // packer's field list rather than from a second copy of the expression.
         let r3 = route(&pts[2].shape, &env).unwrap();
         assert!(r3.notes.iter().any(|n| n == "rowDims = 1158"), "{:?}", r3.notes);
     }
@@ -1984,7 +1630,7 @@ mod tests {
     }
 
     /// Six gates hard-assume cores<=20; CURRENT.md says a different core count
-    /// silently demotes 4/9/12/14/15.
+    /// silently demotes 1/4/9/12/14/15.
     #[test]
     fn a_different_core_count_demotes_six_points() {
         let env = Env { available_core_num: 24, physical_aic: 24, ..Env::default() };
@@ -2042,8 +1688,6 @@ mod tests {
         assert_eq!(route(&pts[5].shape, &env).unwrap().gate, "B");
         // Points 7 and 8 keep gate F but change kernel *variant* -- the pointer
         // dependence is inside longdot_capacity::Launch (3635), not in the gate.
-        // 7 (fp16) takes the DMA-scales kernel; 8 (bf16) has no DMA variant, so
-        // only its ScalarOutput template argument flips (y&31 != 0).
         let p7 = route(&pts[6].shape, &env).unwrap();
         assert_eq!(p7.gate, "F");
         assert!(p7.kernel.contains("DMAScales"), "{}", p7.kernel);
@@ -2085,6 +1729,34 @@ mod tests {
             assert_eq!(point.shape.counts.len() as u32, point.shape.e, "point {}", point.id);
             let sum: u32 = point.shape.counts.iter().sum();
             assert_eq!(sum, point.shape.m, "point {}", point.id);
+        }
+    }
+
+    /// Acceptance (b): the table `emit` prints is the table `plan` evaluates,
+    /// so routing against the emitted cascade is routing against this one. The
+    /// check that makes that more than a sentence is in `emit.rs`
+    /// (`emitted_run_kernel_routes_the_fifteen_points_identically`), which
+    /// re-derives the fifteen rows from the rendered C++ markers.
+    #[test]
+    fn every_gate_the_evaluator_asks_for_exists_in_the_table() {
+        // `route` panics on a missing label, so routing every point plus a few
+        // shapes chosen to fall through to each tail arm covers the lookups.
+        let env = Env::default();
+        for point in points() {
+            route(&point.shape, &env).unwrap();
+        }
+        let probes = [
+            // K==1 but not R.1/R.2 -> R.3; M<=4 small -> L/M; N<=2, M==1 -> O.
+            (4u32, 64u32, 1u32, 64u32, 0u32, false),
+            (2, 4, 2, 2, 0, true),
+            (1, 1, 64, 1, 0, false),
+            (2, 3, 2, 4, 0, true),
+            (1, 2, 4, 8, 0, false),
+            (64, 64, 300, 300, 1, true),
+        ];
+        for (e, m, k, n, gt, bf) in probes {
+            let shape = Shape { e, m, k, n, group_list_type: gt, bf, counts: vec![0; e as usize] };
+            route(&shape, &env).unwrap();
         }
     }
 }
