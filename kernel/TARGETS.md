@@ -1705,3 +1705,77 @@ AIV-only launch 上正确执行了——**不是编译期假象，也没有死�
 
 定价前的先验：要让拆分转正，`IBSet`/`IBWait` 必须比 `SyncAll` 便宜一个数量级
 （≲0.2 µs）。在那之前不要再往"点 7/8 跨核"上投入。
+
+## 权威的 15 点 → body 对照表，由 msprof op name 测得（2026-11-09）
+
+今天两次踩同一个坑（点 7/8 的 `IntegerProductLongNarrowDot`、tiny family 的
+`1231-tiny-reductions.inc`），所以把这张表一次性测准。方法：对每个点跑
+`msprof --ai-core=on --iters 6`，读 `op_summary` 的 `Op Name` 与 `Block Num`。
+**这是实测的执行路径，不是从 dispatch 守卫推的。**
+
+| 点 | blk | 实际执行的 kernel | fragment |
+| --- | --- | --- | --- |
+| 1 | 20 | `p1_half_pair::SearchP1HalfPairOutput11840034` | `3676-p1-half-pair.inc` |
+| 2 | 20 | `mix11::SearchP2Mix115300000` | `0134-cubemix-kernel.inc` |
+| 3 | **2** | `expert_output::SearchTinyExpertOutput6400000<float,half>` | **`5103-tiny-expert-output.inc`** |
+| 4 | 20 | `gmmptq::SearchCubeCompact4700001` | cube-fullk |
+| 5 | **1** | `tiny_capacity_contract::SearchTinyCapacityContract11850017<BF,2,2,1>` | **`5418-tiny-capacity-contract.inc`** |
+| 6 | **1** | `tiny_capacity_unrolled::SearchTinyCapacityUnrolled11850012<!BF,2,2>` | **`5255-tiny-capacity-unrolled.inc`** |
+| 7 | **2** | `SearchLongDotCapacity11840033` | **`3618-longdot-launch.inc`** |
+| 8 | **2** | `SearchLongDotCapacity11840033` | **`3618-longdot-launch.inc`** |
+| 9 | 20 | `gmmptq::SearchCubeCompact4700002` | cube-fullk |
+| 10 | **16** | `p10_fixed_ub::SearchP10FixedUb7300000` | `3242-fixed-ub-outer.inc` |
+| 11 | 40 | `gmmptq::SearchN1FixedLayoutSafe7100000<bf16,bf16,32,800>` | `1142-n1-fixed-layout-safe.inc` |
+| 12 | 20 | `gmmptq::SearchCubeCompact4700003` | cube-fullk |
+| 13 | 40 | `gmmptq::BalancedOverlapShortGroupMatmulKernel` | `1571-balanced-short-group.inc` |
+| 14 | 20 | `gmmptq::SearchCubeCompact4700004` | cube-fullk |
+| 15 | 20 | `gmmptq::SearchCubeCompact4700005` | cube-fullk |
+
+**死 body 现在确认有三个**（15 个点都到不了）：`RowDot`、
+`IntegerProductLongNarrowDot`、以及 `1231-tiny-reductions.inc` 里的
+`TinyCacheReduction` / `TinyShortReduction`。
+
+**方法论教训，比表本身重要**：block 数会撞车（`IntegerProductLongNarrowDot` 和
+`longdot_capacity` 都给 2），dispatch 守卫有多层且顺序决定命中，所以**靠读守卫推
+body 已经错了两次**。以后任何「某点跑的是哪个 body」的断言都必须由 op name 支持。
+
+## tiny family 的第一个分解探针：`no-preload`，三个点全是负结果（2026-11-09）
+
+**先修正立项理由。** `PRIORITY.md` 把 tiny family 选为「到处 10%」的替代目标，
+依据是「**一个 body 三个点**，合计 +70.7」。上表证明**不是一个 body，是三个**，
+分属三个 namespace、三个 fragment，blk 分别 2/1/1：点 3 是 K=2/N=2 的手工全展开
+（`w00..w11`、`ax00..ax31`），点 5/6 才共享一行内层
+`for(t<KC) if(Full||t<k) dot+=S(xx,row*k+t)*S(ww,t*n+col);`。
+所以它**不符合广度目标的形状**——三个点三个 body 就是单点深度，而
+`PRIORITY.md` 自己算过单点深度的边际价值差 26 倍。立项理由作废，+70.7 的空间还在，
+但要分三次挣。
+
+**不选 `no-tiny-mac` 作第一刀的理由**：点 6 全程只有 M·N·K = 2·2·2 = **8 个 MAC**。
+8 个整数乘加不可能是 0.5 µs 的核内时间，所以算术不是被试的对象，前导才是。
+于是第一刀用已有的 `no-preload`（它的 `families` 明确写了覆盖 tiny 路径，
+而三个 body 各自确实都发 5 个 `DataCachePreload`——这点先查过了，没有再认错 body）。
+
+`tnopre` = `gen emit --profile instrument --probe no-preload`。预取是 advisory，
+所以 3/5/6 仍然 PASS 且 bit-exact（确认探针没有改变语义，只改了时间）。
+串行三轮，WARM 中位数（µs）：
+
+| 点 | base r1/r2/r3 | base 均值 | nopre r1/r2/r3 | nopre 均值 | 删掉预取的代价 |
+| --- | --- | --- | --- | --- | --- |
+| 3 | 1.160 / 1.160 / 1.190 | 1.170 | 1.220 / 1.220 / 1.240 | 1.227 | **+0.057 (+4.9%)** |
+| 5 | 1.060 / 1.040 / 1.059 | 1.053 | 1.160 / 1.149 / 1.160 | 1.156 | **+0.103 (+9.8%)** |
+| 6 | 1.040 / 1.060 / 1.040 | 1.047 | 1.050 / 1.050 / 1.059 | 1.053 | **+0.006 (+0.6%)** |
+
+按探针自己写明的读法（「变慢说明预取在干实事、已经计入；不变说明预取距离不对或行本来就热」）：
+
+- **点 3、点 5：预取在干实事**，分别已经为我们挣了 0.057 和 0.103 µs。**已经计入，没有空间。**
+- **点 6：惰性**，同样的 5 个预取一分钱不挣。但删掉也不省（+0.006 在噪声里），
+  所以**也不是空间**——它只是白发的指令，不是可回收的成本。
+
+**三个点全是负结果：前导的预取这一块没有可挣的。** 这缩小了 20–25% 核内工作该去哪找：
+剩下的是 DMA 进出（点 5 的 contract body 用 `DataCopyPad` 过 UB，点 6 的 unrolled 不过）、
+groupList 扫描、标量 encode/store 链，以及已被判定为「人人都付」的启动地板。
+
+**点 5 与点 6 的那个不对称值得记**：同样 5 个预取，点 5 值 0.103 µs 而点 6 值 0。
+点 6 的 E=1，`if(e>1u)` 直接跳掉 groupList 预取，它**没有依赖 groupList 的地址链**；
+点 5 的 E=5 有。所以预取的价值不跟着输入大小走，跟着**是否存在一条
+groupList→地址的依赖链**走。这是下一刀该瞄的地方，而不是预取本身。
