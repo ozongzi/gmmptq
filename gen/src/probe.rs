@@ -188,6 +188,166 @@ const NO_PRELOAD: &[Edit] = &[Edit {
     expect: 57,
 }];
 
+
+// ---------------------------------------------------------------------------
+// Stage-deletion probes.
+//
+// These price one stage's contribution to the *cadence*, which is a different
+// quantity from its occupancy: on point 4 the AIC pipes all read under 20%
+// while MTE2 sat at 77%, and deleting stages showed the whole compute chain
+// was 1.47 of 18.13 us. Occupancy cannot measure that, and every point that
+// has been settled was settled this way.
+//
+// A deleted stage leaves its destination holding stale UB or L0, which is why
+// these are instruments. Read the *pipe busy* delta, not just the duration:
+// `w11gv` moved the clock 0.56 us with every pipe's busy time unchanged, which
+// is how pure serialisation was told apart from removed work.
+// ---------------------------------------------------------------------------
+
+const NO_FIX: &[Edit] = &[
+    // int32 staging (NoQuant) in the two plain bodies, half staging (DEQF16)
+    // in the two ScalarHalf ones -- same statement, different accumulator type.
+    Edit {
+        fragment: "2025-cube-fullk-body.inc",
+        find: "Fixpipe<int32_t, int32_t, CFG_ROW_MAJOR>(stg[base], l0c, fp);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-fix*/;",
+        expect: 1,
+    },
+    Edit {
+        fragment: "2472-cube-fullk-unit-body.inc",
+        find: "Fixpipe<int32_t, int32_t, CFG_ROW_MAJOR>(stg[base], l0c, fp);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-fix*/;",
+        expect: 1,
+    },
+    Edit {
+        fragment: "3676-p1-half-pair.inc",
+        find: "Fixpipe<half, int32_t, CFG_ROW_MAJOR>(stg[base], l0c, fp);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-fix*/;",
+        expect: 1,
+    },
+    Edit {
+        fragment: "4225-cube-fullk-body-scalar-half.inc",
+        find: "Fixpipe<half, int32_t, CFG_ROW_MAJOR>(stg[base], l0c, fp);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-fix*/;",
+        expect: 1,
+    },
+];
+
+const NO_MAD: &[Edit] = &[Edit {
+    // Identical in all four cube bodies and in CubeMix, hence five.
+    fragment: "*",
+    find: "Mmad(l0c, a, b, mp);",
+    replace: "/*GMM_WRONG_ON_PURPOSE no-mad*/;",
+    expect: 5,
+}];
+
+/// The whole credit ring, both directions. Deleting one side alone **hangs**:
+/// drop the AIC announce and the AIV waits forever on a flag nobody sets, so
+/// every site has to go together. Worth -15.4% on point 4 and -19.1% on point
+/// 12, and the AIV's per-core busy time collapsed 14.47 -> 5.94 against AIC's
+/// 13.35, which is how AIC was established as the long leg.
+const NO_RING: &[Edit] = &[
+    // AIC: wait for a staging credit, then announce the finished tile.
+    Edit {
+        fragment: "*",
+        find: "CrossCoreWaitFlag(uint16_t(4u+tileId));",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-ring*/;",
+        expect: 5,
+    },
+    Edit {
+        fragment: "*",
+        find: "CrossCoreSetFlag<2, PIPE_FIX>(tileId);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-ring*/;",
+        expect: 5,
+    },
+    Edit {
+        fragment: "*",
+        find: "CrossCoreWaitFlag(uint16_t(4u+(q&3u)));",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-ring*/;",
+        expect: 5,
+    },
+    // AIV: the four cube bodies spell both halves on one `if constexpr` line,
+    // one per BM arm. These must be replaced before the bare CubeMix forms
+    // below would match them, so they are scoped by fragment there, not here.
+    Edit {
+        fragment: "*",
+        find: "if constexpr (BM <= 32 || BM == 208) { CrossCoreWaitFlag(tileId); if(last-first>4u) CrossCoreSetFlag<2, PIPE_MTE3>(uint16_t(4u+tileId)); }",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-ring*/;",
+        expect: 4,
+    },
+    Edit {
+        fragment: "*",
+        find: "if constexpr (BM > 32 && BM != 208) { CrossCoreWaitFlag(tileId); if(last-first>4u) CrossCoreSetFlag<2, PIPE_MTE3>(uint16_t(4u+tileId)); }",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-ring*/;",
+        expect: 4,
+    },
+    // CubeMix spells its AIV half on two separate lines and has no BM arms.
+    // Scoped to that fragment so the bare strings cannot reach the guarded
+    // lines above, whatever order the edits run in.
+    Edit {
+        fragment: "0134-cubemix-kernel.inc",
+        find: "CrossCoreWaitFlag(tileId);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-ring*/;",
+        expect: 1,
+    },
+    Edit {
+        fragment: "0134-cubemix-kernel.inc",
+        find: "if(last-first>4u) CrossCoreSetFlag<2, PIPE_MTE3>(uint16_t(4u+tileId));",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-ring*/;",
+        expect: 1,
+    },
+];
+
+
+/// Both `WholeReduceSum` levels in all three dot-product bodies.
+///
+/// Prices the ceiling on replacing the primitive. On point 11 that was 1.36 us
+/// -- 44% of all vector work, and 7.2x what its element count should cost --
+/// and `p11add`'s aligned `Add` fold collected most of it (-8.0%). But the
+/// cause was the *stride*, not the primitive: point 11 reads with
+/// `srcRepStride = pairs/8 = 50` blocks (64 floats, then jump 400), while
+/// `RowDot` and the longdot body read contiguously at `srcRepStride = 8`.
+/// Points 7/8's reduce touches 8320 fp32 = 0.16 us at full lane width against
+/// an entire AIV vec busy of 1.05 us, so a 7x reduce would not fit inside
+/// their total. Expect this probe to show ~nothing on the contiguous bodies.
+const NO_REDUCE: &[Edit] = &[
+    Edit {
+        fragment: "1142-n1-fixed-layout-safe.inc",
+        find: "WholeReduceSum(scratch[col/64u],f[col],uint64_t(Min(64u,realPairs-col)),uint8_t(nr),8,1,uint8_t(pairs/8u));",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-reduce*/;",
+        expect: 1,
+    },
+    Edit {
+        fragment: "1142-n1-fixed-layout-safe.inc",
+        find: "WholeReduceSum(spaced,scratch,uint64_t((realPairs+63u)/64u),uint8_t(nr),8,1,1);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-reduce*/;",
+        expect: 1,
+    },
+    Edit {
+        fragment: "1376-row-dot.inc",
+        find: "for (uint32_t r=0;r<have;++r) WholeReduceSum(red1[r*16],xf[r*fp],64,fp/64,1,1,8);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-reduce*/;",
+        expect: 1,
+    },
+    Edit {
+        fragment: "1376-row-dot.inc",
+        find: "WholeReduceSum(red2,red1,16,have,1,1,2);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-reduce*/;",
+        expect: 1,
+    },
+    Edit {
+        fragment: "1471-long-narrow-dot.inc",
+        find: "WholeReduceSum(red1,wf,64,partialCount,1,1,8);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-reduce*/;",
+        expect: 1,
+    },
+    Edit {
+        fragment: "1471-long-narrow-dot.inc",
+        find: "WholeReduceSum(red2,red1,16,groups,1,1,2);",
+        replace: "/*GMM_WRONG_ON_PURPOSE no-reduce*/;",
+        expect: 1,
+    },
+];
 pub fn probes() -> &'static [Probe] {
     &[
         Probe {
@@ -232,6 +392,53 @@ pub fn probes() -> &'static [Probe] {
             unsupported: "the cube bodies issue no DataCachePreload at all, so this probe is inert \
                           for large shapes",
             edits: NO_PRELOAD,
+        },
+        Probe {
+            name: "no-fix",
+            what: "delete the Fixpipe that drains L0C to staging",
+            read: "its share of the per-tile cadence. On point 4 this was -0.72 us of 18.13 \
+                   (-4.0%), the largest of the four compute stages and still only a twentieth \
+                   of the point.",
+            families: "the four cube bodies",
+            unsupported: "CubeMix spells the same call with its own staging type; add an Edit for \
+                          it if the Z fallback is ever the arm under test. The AIV-only families \
+                          have no Fixpipe.",
+            edits: NO_FIX,
+        },
+        Probe {
+            name: "no-mad",
+            what: "delete the Mmad accumulation itself",
+            read: "the cube's actual arithmetic as a share of the clock. On point 4: -0.48 us, \
+                   -2.6%. Check that mte1 did not collapse with it -- if the feeder stopped too, \
+                   the reading is two stages, not one.",
+            families: "the four cube bodies and CubeMix",
+            unsupported: "the AIV-only families, which multiply with vector Mul rather than Mmad",
+            edits: NO_MAD,
+        },
+        Probe {
+            name: "no-ring",
+            what: "delete the whole AIC<->AIV credit ring, both directions",
+            read: "-15.4% on point 4 and -19.1% on point 12, the largest single structural cost \
+                   found. But read the aiv column before concluding it is overhead: on point 12 \
+                   the saving was 1.61 us of AIV wait-spin against an AIC that moved 0.05, so it \
+                   is the data dependency itself, not bookkeeping. Halving the announces moves \
+                   that cost rather than removing it (+4.4%).",
+            families: "the four cube bodies and CubeMix",
+            unsupported: "the AIV-only families have no cross-core ring; point 11's intra-core \
+                          GvBarriers are a different mechanism",
+            edits: NO_RING,
+        },
+        Probe {
+            name: "no-reduce",
+            what: "delete both WholeReduceSum levels in all three dot-product bodies",
+            read: "the ceiling on replacing the primitive. 1.36 us on point 11, where the cause \
+                   was the strided source rather than the primitive -- so expect near-nothing on \
+                   RowDot and the longdot body, which read contiguously. If that holds, the \
+                   reusable finding is about strided vector reads, not WholeReduceSum.",
+            families: "n1-fixed-layout-safe (11), row-dot (none of the 15), long-narrow-dot (7/8)",
+            unsupported: "the tiny reductions (3/5/6) reduce in registers; the cube families \
+                          accumulate in L0C",
+            edits: NO_REDUCE,
         },
     ]
 }

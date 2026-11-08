@@ -163,3 +163,31 @@ Z 是真正的保险：`LeanPlanCube` 纯粹从 `m,k,n,e` 推导 `m0/n0/k0/kl/nT
 - 机械细节：复制循环（5766–5771）每块只写 16-half 对齐的前缀（`al = n/16*16`）却按完整 `n` 推进 `done`，故每块尾部最多 15 个 half 未被写。对其用途无害。
 
 **generator 要接管这件事**：探测不该靠 C++ 预处理器开关，而应是 `--profile probe` 的输出，且 `Point()` 的硬编码形状表要换成运行时比对 generator 注入的形状描述。
+
+## 阶段删除探针（2026-11-08 新增）
+
+容器侧那套 `mk*.sh` 脚本产出了本轮**每一个**已结案的结论，但它们只存在于容器的
+`~/gmm-rebuild/`，容器一重置就没了。这五个探针把那套仪器搬进 generator：
+
+| 探针 | 删掉什么 | 已测结果 |
+| --- | --- | --- |
+| `no-fix` | 排空 L0C 的 Fixpipe | 点 4：−0.72 µs（−4.0%） |
+| `no-mad` | Mmad 累加本身 | 点 4：−0.48 µs（−2.6%） |
+| `no-ring` | 整个 AIC↔AIV 信用环，双向 | 点 4 −15.4%、点 12 −19.1% |
+| `no-reduce` | 三个点积 body 的两级 `WholeReduceSum` | 点 11：1.36 µs = 向量工作的 44% |
+| `halve-k` 等三个 | （原有） | — |
+
+两条设计上的要点：
+
+- **`no-ring` 必须双向一起删。** 只删 AIC 的 announce 会**死锁**——AIV 会永远等一个
+  没人设置的 flag。四个 cube body 把 AIV 两侧写在同一行 `if constexpr` 上（每个 BM arm 一行），
+  而 `CubeMix` 写成两行且没有 BM arm，所以 CubeMix 那两条 Edit 按 fragment 限定作用域，
+  否则它们的裸字符串会命中别的 fragment 的守卫行。
+- **`no-ack` 被试过并移除了。** 它只删 ack 半边、保留 announce，所以答案仍然正确——
+  于是 `every_probe_applies_with_its_declared_arity` 正确地拒绝了它（替换不带
+  `GMM_WRONG_ON_PURPOSE` 横幅）。那条不变量是对的：探针机制是给仪器的。
+  而 `no-ack` 实测**恰好零**（点 12 的 7.26 对 7.27、点 4 的 18.00 对 18.02），
+  既不是仪器也不是想要的候选。结论记在 `kernel/TARGETS.md`。
+
+仍然没有覆盖的：`w11gv`（`GvBarrier`）、`w11gl`（合成 group list）、`w13xs`（xScale 前导 DMA）、
+`w4ldb`/`w4lda`（L1→L0 载入）。都是同一机制，加 Edit 即可。
