@@ -1660,3 +1660,48 @@ Add(integerSums, integerSums, integerSums[8],   8)
 **结论：弃，并且连带注销"把 fold 搬到 `RowDot` 作为 11/14 新点的保险"这项**——
 往死码里写保险不是保险。真要给新点上保险，得先知道新点会不会命中
 `longdot_capacity`，而那条路上的对折树已经在了。
+
+## AIV↔AIV 同步：载具存在，但一个 barrier 比整个点还贵（2026-11-09）
+
+**存在性查清了。** `$ASCEND/latest/asc/include/basic_api/kernel_operator_block_sync_intf.h`
+在 `__NPU_ARCH__==2201` 上声明了三件东西（2201 走 `#else` 分支，不是 3510/5102 的
+`SyncAllConfig` 分支）：
+
+| 原语 | 签名 | dav-2201 编译 |
+| --- | --- | --- |
+| `SyncAll<isAIVOnly>()` | 无 workspace，全核栅栏 | ✅ |
+| `SyncAll<isAIVOnly>(gmWs, ubWs, usedCores)` | workspace 形式 | ✅ |
+| `IBSet<isAIVOnly>(gmWs, ubWs, blockIdx, eventId)` / `IBWait<...>` | **逐核成对**同步 | ✅ |
+
+头文件里只有声明、没有定义（整个 `asc/include` 只有这一个文件提到 `SyncAll`），
+所以"能不能用"必须靠编译+链接+上板判定，不能靠 grep。三者用
+`bisheng --npu-arch=dav-2201 --asc-aicore-lang` 都干净编译（`~/synctest/t.asc`、`t2.asc`）。
+
+**然后上板定价。** `w78sync` = `gen-final` 在点 7/8 真正执行的那个 body
+（`SearchLongDotCapacity11840033`，见上一节）里插入**一个** `AscendC::SyncAll<true>()`，
+其余不动。tp7/tp8 仍然 PASS 且 bit-exact，所以它真的链接进去并在 2 block 的
+AIV-only launch 上正确执行了——**不是编译期假象，也没有死锁**。
+
+串行两轮，tp7，WARM 中位数（µs）：
+
+| 变体 | r1 | r2 | 均值 |
+| --- | --- | --- | --- |
+| `w78base` | 2.000 | 2.020 | **2.010** |
+| `w78sync`（+1 SyncAll） | 4.170 | 4.200 | **4.185** |
+
+**一个 `SyncAll<true>()` = +2.18 µs。** 点 7 的全长是 2.01 µs，tbest 2.069。
+也就是说**一个栅栏比整个测试点还贵**，而任何跨核拆分至少需要一个。
+拆分要想转正，得省下当前点时间的 108% 以上——不可能。
+
+**所以点 7/8 跨核拆分的状态变了，但不是变好**：此前记为"规则允许、工程上没路"，
+现在是**工程上有三条路，而其中唯一已定价的那条贵到出局**。
+
+**唯一还没定死的是 `IBSet`/`IBWait`。** 它是逐核成对的，2 核拆分本来也不需要全核栅栏，
+代价结构可能完全不同（`SyncAll` 的 2.18 µs 很可能是 GM 往返 + 全核轮询，而成对
+形式不必付这个）。但 `IBSet` 需要一个 GM workspace，而
+`SearchLongDotCapacity11840033(x,w,xs,ws,y,k)` 的签名里**没有** workspace 指针
+（cube 那几个 body 才有 `(GM_ADDR)scratch.p`），所以给它定价不是一条 sed，
+而是要在 `longdot_capacity::Launch` 里把 workspace 接进去——**这是 generator 的活**。
+
+定价前的先验：要让拆分转正，`IBSet`/`IBWait` 必须比 `SyncAll` 便宜一个数量级
+（≲0.2 µs）。在那之前不要再往"点 7/8 跨核"上投入。
