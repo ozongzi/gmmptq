@@ -133,7 +133,43 @@ E4 M1027 K769 **N1**，counts `[1,511,0,515]`。走闸门 P → `SearchN1FixedLa
 
 攻击方向：加大每批行数（`R=32` 是模板参数，`C=800` 恰好是 `Up(769,32)`，两者都卡在 UB 固定布局 184672 B 上）；减少每行的独立 DMA 次数；把 40 个 block 的归约结构换成更少同步的形式。
 
-### 点 13（+48.3）—— weight DMA 带宽受限
+### 点 13（+48.3）—— 一行 host 改动：让 weight 的 srcStride 变成 0
+
+**根因已定位。** weight 的 DMA 在 `kernel.asc:1816-1822`，有两条路径：
+
+```cpp
+p = flat ? {1, klen*cols, 0, 0, 0}                      // 一次连续
+         : {klen, cols, t_->n - cols, 0, 0};            // klen 次短传输
+```
+
+而 1754 行是 `const bool flat = false; // Host nb is Up(N,32), matching DMA padding.`
+——**`flat` 被硬编码成 false，且注释的前提不成立**：host 写的是
+`out.nb = std::min(nPitch, 192u)`（3032 行），对点 13 是 **192 而不是 `Up(257,32) = 288`**。
+
+于是点 13 走第二条：`cols = 192`、**`srcStride = 257 - 192 = 65`**，即 `klen` 次各 192 字节、
+每次跳 65 字节。整个专家在 GM 里是 **65,535 字节连续**，却被拆成约 512 次平均 128 字节的带 stride 短传输。
+这就是 212 GB/s 的来源。
+
+**修法不需要碰 flat 路径。** 第二条路径里只要 `cols == t_->n`，`srcStride` 就是 0，源地址即连续——
+和点 11 那个被证实高效的 `{nr, 769, 0, 0, 0}` 是同一种描述符。
+**绝不要打开 `flat`**：它的 `{1, klen*cols, 0, 0, 0}` 会让 UB 行距变成 257，非 32 对齐，
+而 `kernel.asc:590` 记着「未对齐的向量操作数起始地址会挂死该单元」。
+
+所以改动是一行：`out.nb = std::min(nPitch, 192u);` → `out.nb = nPitch;`
+
+UB 账已核：`BalancedOverlapShortGroupUbBytes` 化简为 `10336 + 7*kUp + 7*kc*nb + 10*nPitch`，
+现值 `kc=128, nb=192, nPitch=288` 得 **186,144**，与既有记录吻合，公式无误。
+改 nb=288 后现有的 `kc /= 2` 循环自动把 kc 降到 64：`10336 + 448 + 7*64*288 + 2880 = 142,688 ≤ 188,160`，
+尚有余量；`minWidth` 守卫算出 64，不会把 nb 抬回去。
+
+结果：`cols = min(288, 257) = 257 == n` ⇒ `srcStride = 0`，每个专家的 weight 变成
+**4 次连续传输、每次 64×257 = 16,448 字节**。
+
+验证要点：`nb` 同时喂给行切分逻辑，而 `nPitch > nb` 本来就是设备侧要切行的原因，所以**必须跑完整正确性检查**。
+对照实验：`nb=256`（刚好小于 N ⇒ `cols=256`、`srcStride=1`）应该仍然慢——若如此则机制确认，
+而不是「nb 变大」带来的无关副作用。
+
+### 点 13 的旧分析（保留作对照）
 E128 M63 K255 N257，counts `[0,1]` 重复 63 次 + `[0,0]`，即 **63 个非空专家、每个恰好 1 个 token**。走闸门 S → `BalancedOverlapShortGroupMatmulKernel`（纯 AIV），40 blocks。
 
 - weight 读取：63 × 255 × 257 = **4.13 MB**，绝对主导
