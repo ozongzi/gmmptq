@@ -1609,3 +1609,54 @@ batches-per-core 的那一端。
 
 **结论：弃。** `p11r16`/`p11r8` 两个变体废弃，R=32（一核一 batch）保持。连带关闭
 「给 barrier 造一个可重叠对象」这整条线，而不只是关闭 R=32 这一个取值。
+
+## `no-reduce` 探针的结果推翻了点 7/8 的 dispatch 地图（2026-11-09）
+
+`w78base` = `gen emit --profile final`（未改动，自己就是对照），`w78red` = 同一次
+emit 加 `--probe no-reduce`。两者都编译干净；`w78base` 15/15 PASS，所以**生成器的
+`final` 本身是一个合法内核**（它与 repo 的 `kernel/kernel.asc` 只差 `probe_ask`
+那 162 行，`gen/CURRENT.md` 已记在案，不是回归）。
+
+串行两轮，点 7/8，WARM 中位数（µs）：
+
+| 点 | `w78base` r1 | `w78red` r1 | r2 base | r2 red |
+| --- | --- | --- | --- | --- |
+| 7 | 2.020 | 2.020 | 2.020 | 2.020 |
+| 8 | 2.020 | 2.020 | 2.020 | 2.020 |
+
+**八次全部 2.020，末位都不动，而且 `w78red` 在点 7/8 上仍然 bit-exact**
+（只有点 11 按预期 FAIL，898 个元素超容差）。删掉代码既不改时间也不改答案，
+只有一个解释：**那段代码在点 7/8 上根本没执行。**
+
+查实了：`WholeReduceSum` 在整个 emit 里只有 6 处，分属三个 body，无重复副本。
+点 7/8 走的不是 `IntegerProductLongNarrowDot`，而是
+`longdot_capacity::Launch` → `SearchLongDotCapacity11840033<Capacity,BF,Scalar>`
+或 `SearchLongDotCapacityDMAScales`（fp + scale 地址未 4 字节对齐时），都是
+`<<<2,nullptr,stream>>>`。**blk=2 对得上，所以之前是靠 block 数认错了 body**：
+`IntegerProductLongNarrowDot` 的守卫（`M==1 && N<=2`，`blocks=min(2*cores,N)`）
+也会给出 2，两条路长得一样。
+
+**修正 TARGETS.md 此前的记载**：`IntegerProductLongNarrowDot` 不服务点 7/8，
+它和 `RowDot` 一样是**15 个点都到不了的死码**。全表现在有两个死 body，不是一个。
+
+**这条线彻底关掉，但不是因为"收益约 0.16 µs"。** 读 `longdot_capacity::Dot::Run`
+发现它的归约**已经就是 Add 对折树**：
+
+```
+Add(integerSums, integerSums[64], integerSums, 64, ...)   // 带 repeat 的那一级
+Add(integerSums, integerSums, integerSums[32], 32)
+Add(integerSums, integerSums, integerSums[16], 16)
+Add(integerSums, integerSums, integerSums[8],   8)
+→ Sum<0>(): for(i<8) total += values.GetValue(i)          // 最后 8 个走标量
+```
+
+也就是说 `p11add` 想往点 7/8 搬的那棵树，**点 7/8 已经有了**，而且尾部 8 个元素
+是标量 `GetValue` 而非向量原语。所以：
+- 预测"≈0.16 µs ≈ 零"**数值上对了，机制上错了**——不是"折叠省不下来"，是**没有可折叠的对象**。
+- 前一节"真正的变量是跨步（srcRepStride）"仍然成立且更有分量：点 11 是唯一一个
+  用跨步 `WholeReduceSum` 的 body，而它已经被 `p11add` 修掉了。这个原语级发现
+  **没有第二个点可搬**，`RowDot` 的那份保险也没有意义（它是死码）。
+
+**结论：弃，并且连带注销"把 fold 搬到 `RowDot` 作为 11/14 新点的保险"这项**——
+往死码里写保险不是保险。真要给新点上保险，得先知道新点会不会命中
+`longdot_capacity`，而那条路上的对折树已经在了。
