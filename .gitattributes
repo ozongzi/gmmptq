@@ -1,0 +1,4 @@
+# 容器里跑的东西必须是 LF。这台机器 core.autocrlf=true，重新 checkout 一次就会把
+# kernel/ 下的脚本和源码换成 CRLF，shebang 里多一个 CR 就是 bash 语法错误，
+# 而备份的全部意义就是拿回去逐字节相同。
+kernel/** text eol=lf
