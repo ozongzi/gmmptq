@@ -52,9 +52,39 @@
 
 ## 2. generator
 
-见 `gen/DESIGN.md`。当前状态：里程碑 0（verbatim 字节级复现）与 `gen plan`（15 点路由干跑，
-25 个测试绿）已完成；正在做「把分派级联从 `plan` 用的同一张表生成出来」，
-使 11 月 14 日加闸门成为改数据而非改代码。
+见 `gen/DESIGN.md`。
+
+### 已完成
+
+- **里程碑 0**：`emit --profile verbatim` 字节级复现当前 `kernel/kernel.asc`（45 片段，sha256 一致）
+- **`gen plan`**：15 点路由干跑，秒级，与 `CURRENT.md` 的路由表完全吻合
+- **`emit --profile final`**：`run_kernel` 由 `cascade.rs` 的**同一张表**生成（39 个闸门）。
+  `plan` 走这张表求值，`emit` 打印这张表，**没有第二份字符串**。
+  tile 参数、`dims` 字段布局、K 容量阶梯、各字段允许上界全部由表导出。
+  产出 318,101 字节 / 6,083 行，**容器编译通过**（`~/gmm-rebuild/h-genfinal`）。
+- **加一条闸门 = 改一张表里 14 行**，不改代码。`plan --what-if --tiles … --launcher …`
+  会打印 C++、位打包判定、15 点是否改道、以及可直接粘贴的表项。
+- **位打包守卫**：上界由闸门自身的谓词导出，12 种 `dims` 布局全部建模。
+  `emit --profile final` 写出任何字节之前先跑这个检查。实测拒绝示例：
+  `LaunchAlignedMedium64` 的 `k/128-1` 是 2 位（max 3），而闸门允许 `p.k` 到 1024（编码为 7）⇒ 拒绝。
+- **合规由生成时保证**：`final` 不输出 `probe_ask` 片段与 `#if GMM_ASK` 钩子
+  （`GMM_ASK` 默认 0 时预处理结果相同）。于是 `ENDGAME.md` 的提交前 grep
+  在生成文件上是 **0 命中，而在现有 `kernel.asc` 上是 10 命中**。
+  这同时去掉了 `probe_ask::Point` 里那张 15 个已公布形状的硬编码表——
+  全文唯一真正像「逐条匹配评测用例」的东西。
+- **`emit --profile instrument --probe <名>`**：四个分解探针（`halve-k`、`halve-x-dma`、
+  `halve-w-dma`、`no-preload`），带 `GMM_WRONG_ON_PURPOSE` 横幅、每行标记、CLI 警告、`-o` 强制。
+  刻意**不**叫 `probe`——那个名字留给 `GMM_ASK` 内容预言机（必须提交才能读，且被 `final` 拒绝），
+  而 instrument 是本地读、绝不可提交。**一个名字两种东西，就是 11:40 上传错文件的方式。**
+
+### 待办
+
+- 生成文件的 **15 点 AC 验证 + 测时与 `h-m-p11Q` 对平**（需 NPU，排在第 1 级之后）
+- `lab submit` 前加第五根针：`grep -q GMM_WRONG_ON_PURPOSE` 则拒绝上传
+- 已知残余漂移风险：闸门 R 的 `selectedPitch`/`selectedUb` 算术是 verbatim 字符串，
+  其 Rust 孪生在 `Ctx::new`，只交叉校验了比较常数、没校验算术本身
+- `halve-k` 未覆盖 tiny 寄存器族（3/5/6，无 K 循环）、longdot（7/8）、outer（10）、N==1 matvec（11）；
+  `halve-x-dma`/`halve-w-dma` 仅 cube；**`no-preload` 对 cube body 是惰性的——它们一个预读都没有**
 
 ## 3. 分数到 80+
 
