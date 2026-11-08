@@ -84,6 +84,8 @@ enum Cmd {
     },
     /// Send a kernel to the judge, wait out any cooldown, poll for the verdict.
     Submit {
+        /// The kernel source; `-` reads stdin, so an assembler can pipe
+        /// straight in without a temporary file.
         kernel: PathBuf,
         #[arg(short, long)]
         account: String,
@@ -231,19 +233,22 @@ fn run(cli: &Cli) -> Result<()> {
 
 // ---- commands -----------------------------------------------------------
 
-fn cmd_minify(files: &[PathBuf]) -> Result<()> {
+/// A source file, or stdin when the path is `-`.
+fn read_source(path: &std::path::Path) -> Result<String> {
     use std::io::Read;
+    if path.as_os_str() != "-" {
+        return Ok(std::fs::read_to_string(path)?);
+    }
+    let mut buffer = String::new();
+    std::io::stdin().read_to_string(&mut buffer)?;
+    Ok(buffer)
+}
+
+fn cmd_minify(files: &[PathBuf]) -> Result<()> {
     let targets: Vec<PathBuf> =
         if files.is_empty() { vec![PathBuf::from("-")] } else { files.to_vec() };
     for path in targets {
-        let text = if path.as_os_str() == "-" {
-            let mut buffer = String::new();
-            std::io::stdin().read_to_string(&mut buffer)?;
-            buffer
-        } else {
-            std::fs::read_to_string(&path)?
-        };
-        print!("{}", minify::strip_source(&text));
+        print!("{}", minify::strip_source(&read_source(&path)?));
     }
     Ok(())
 }
@@ -360,9 +365,17 @@ fn cmd_submit(
     reason: &str,
     as_json: bool,
 ) -> Result<()> {
+    // Read the source before anything else: a pipe that produced nothing must
+    // not cost a quota slot, and the judge is not asked until it has content.
+    let raw = read_source(kernel)?;
+    if raw.trim().is_empty() {
+        return Err(Error::Other(format!(
+            "{} is empty; nothing to submit",
+            if kernel.as_os_str() == "-" { "stdin".into() } else { kernel.display().to_string() }
+        )));
+    }
     let judge = Judge::new(&lab.store, one);
     let local = local_times(local, judge.case_count()?)?;
-    let raw = std::fs::read_to_string(kernel)?;
     // What crosses the wire carries no comments and no blank lines. Stored and
     // hashed as sent, so the history and the judge agree on one text.
     let source = minify::strip_source(&raw);

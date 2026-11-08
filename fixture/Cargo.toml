@@ -1,0 +1,9 @@
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+# No dependencies, on purpose. This binary is cross-compiled to the aarch64
+# devenv container, which has no cargo and no crates.io access, and it has to
+# run there with no project checkout, no database and no network.
+[dependencies]

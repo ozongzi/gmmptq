@@ -7,7 +7,8 @@ cargo lab --help          # 仓库根目录或任意子目录；别名在 .cargo
 cargo lab quota -a ozongzi
 ```
 
-仓库根是一个 cargo workspace（成员只有 `lab`），产物在根目录的 `target/release/lab`。
+仓库根是一个 cargo workspace，产物在根目录的 `target/release/`。另一个成员是
+[`fixture`](../fixture/README.md)——本地数据和参考答案，零依赖、能进容器，和 `lab` 互不牵连。
 
 Windows、Linux、macOS 同一份代码，没有平台相关的调用。
 
@@ -86,6 +87,7 @@ SQLite 的 `gmm_score` / `gmm_ratio`，视图和 Rust 算的是同一个数。
 lab quota  -a ozongzi                     # 今天还剩几次、冷却还有多久（判题器口径）
 lab submit kernel.asc -a ozongzi --reason "single-kernel v3" \
     --local 22.70,9.06,3.67,19.44,3.65,3.39,4.87,4.97,12.46,5.98,7.55,7.71,19.70,49.50,41.18
+lab submit -   -a ozongzi --reason "..." --local …   # kernel 从 stdin 读
 lab status [id]                           # id 可以是前缀或 judge_id；默认最近一个判完的
 lab status [id] --refresh                 # 先 GET 一次判题结果和排行榜，绝不重新 POST
 lab history                               # 所有机器的提交，最新 30 条
@@ -104,8 +106,9 @@ lab sql "<query>"                         # 只读，吐 JSON
 `secrets/accounts` 两个路径，工作区里别的改动用 `--autostash` 原样放回；但 push 推的是
 当前分支，所以分支上别的本地提交会一起推上去。
 
-冷却中的 `submit` 直接排队等，判题轮询最长 900 s。过线的源码去掉注释和空行，存下来和
-算 sha 的都是**发出去的那一版**。
+`submit` 的 kernel 参数写 `-` 就从 stdin 读，组装器可以直接管道进来，不用落临时文件；
+管道里什么都没有时在占名额之前就报错。冷却中的 `submit` 直接排队等，判题轮询最长 900 s。
+过线的源码去掉注释和空行，存下来和算 sha 的都是**发出去的那一版**。
 
 ## 视图
 

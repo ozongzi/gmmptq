@@ -1,3 +1,5 @@
-# `cargo lab <command>` runs the lab CLI from anywhere in the workspace.
+# `cargo lab <command>` and `cargo fixture <command>` run the two binaries from
+# anywhere in the workspace.
 [alias]
 lab = "run --release --quiet -p lab --"
+fixture = "run --release --quiet -p fixture --"

@@ -1,3 +1,7 @@
 [workspace]
-members = ["lab"]
+members = ["lab", "fixture"]
 resolver = "3"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
