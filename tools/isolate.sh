@@ -8,7 +8,7 @@
 # has mixed CRLF/LF and must survive unchanged.  Seams are located on a CR-stripped
 # index copy, which has the same line numbering.
 set -eu
-BASE=$1; REF=$2; P=$3; OUT=$4
+BASE=$1; REF=$2; P=$3; OUT=$4; OWN=${5:-0}   # OWN = ticks on the isolated point itself
 case "$P" in ''|*[!0-9]*) echo "point must be 0..15 (0 = spin every point: the calibration run)"; exit 1;; esac
 [ "$P" -ge 0 ] && [ "$P" -le 15 ] || { echo "point must be 0..15 (0 = spin every point: the calibration run)"; exit 1; }
 IDX=$(mktemp); trap 'rm -f "$IDX"' EXIT
@@ -30,7 +30,7 @@ sed -n "${PB_B}p" "$REF" | grep -qx '#endif' || { echo "probe block does not end
 T=""
 for i in $(seq 1 15); do
   [ -n "$T" ] && T="$T,"
-  if [ "$i" = "$P" ]; then T="${T}0ull"; else T="${T}2500000ull"; fi
+  if [ "$i" = "$P" ]; then T="${T}${OWN}ull"; else T="${T}2500000ull"; fi
 done
 
 {
