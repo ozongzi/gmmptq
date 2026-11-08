@@ -11,6 +11,7 @@
 //!
 //! Zero dependencies, so the argument parsing is by hand -- same as `fixture`.
 mod chunks;
+mod dispatch;
 mod sha256;
 mod tmpl;
 
@@ -24,9 +25,19 @@ fn usage() -> ! {
          \n\
          emit --profile <name> [-o <path>]   generate kernel.asc (stdout without -o)\n\
          check-chunks [-v]                   verify the verbatim reassembly's sha256\n\
-         plan <E> <M> <K> <N> <gt> <dtype> <counts...>\n\
+         plan <E> <M> <K> <N> <gt> <fp16|bf16> <counts...>\n\
+         plan --all                          the 15 published points, one line each\n\
          \n\
-         \x20                                dry run: which strategy a shape takes\n\
+         \x20 plan options\n\
+         \x20   --cores <n>       availableCoreNum (default 20)\n\
+         \x20   --aic <n>         GetCoreNumAic()  (default = --cores)\n\
+         \x20   --ptr <p>=<v>     low 7 bits of a device pointer; p in\n\
+         \x20                     x weight xScale weightScale groupList y\n\
+         \x20   --misaligned      shorthand for all six pointers = 1\n\
+         \x20   --no-l1-guard     drop gate Y's 512*kp<=524032 check (6105), to\n\
+         \x20                     demonstrate the p1_half_pair k-field landmine\n\
+         \x20   --json            machine-readable output\n\
+         \n\
          classes                             the shape classifier's classes and predicates\n\
          \n\
          profiles: verbatim  the milestone 0 safety net, the current kernel as-is\n\
@@ -80,10 +91,7 @@ fn main() {
     let code = match argv.get(1).map(String::as_str) {
         Some("emit") => cmd_emit(&argv),
         Some("check-chunks") => cmd_check_chunks(&argv),
-        Some("plan") => not_yet(
-            "plan",
-            "it needs classify.rs, which cannot exist before a single predicate does.",
-        ),
+        Some("plan") => cmd_plan(&argv),
         Some("classes") => not_yet(
             "classes",
             "the shape classifier is milestone 1; today's kernel dispatches by equality.",
@@ -203,6 +211,520 @@ fn cmd_emit(argv: &[String]) -> i32 {
         }
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// plan -- a dry run of run_kernel's dispatch cascade (see dispatch.rs)
+// ---------------------------------------------------------------------------
+
+/// `gen plan` arguments. Hand-rolled, same house style as `emit`.
+struct PlanArgs {
+    env: dispatch::Env,
+    all: bool,
+    json: bool,
+    positional: Vec<String>,
+    misaligned: bool,
+}
+
+fn parse_plan_args(argv: &[String]) -> Result<PlanArgs, String> {
+    let mut args = PlanArgs {
+        env: dispatch::Env::default(),
+        all: false,
+        json: false,
+        positional: Vec::new(),
+        misaligned: false,
+    };
+    let mut aic: Option<u32> = None;
+    let mut at = 2;
+    while at < argv.len() {
+        match argv[at].as_str() {
+            "--all" => {
+                args.all = true;
+                at += 1;
+            }
+            "--json" => {
+                args.json = true;
+                at += 1;
+            }
+            "--misaligned" => {
+                args.misaligned = true;
+                args.env.ptrs = dispatch::Ptrs::misaligned();
+                at += 1;
+            }
+            "--no-l1-guard" => {
+                args.env.l1_guard = false;
+                at += 1;
+            }
+            "--cores" => {
+                let value = argv.get(at + 1).ok_or("--cores needs a value")?;
+                args.env.available_core_num =
+                    value.parse().map_err(|_| format!("--cores {value:?} is not a number"))?;
+                at += 2;
+            }
+            "--aic" => {
+                let value = argv.get(at + 1).ok_or("--aic needs a value")?;
+                aic = Some(value.parse().map_err(|_| format!("--aic {value:?} is not a number"))?);
+                at += 2;
+            }
+            "--ptr" => {
+                let spec = argv.get(at + 1).ok_or("--ptr needs <name>=<value>")?;
+                let (name, value) = spec.split_once('=').ok_or("--ptr wants <name>=<value>")?;
+                let value: u32 = value
+                    .parse()
+                    .map_err(|_| format!("--ptr {spec:?}: {value:?} is not a number"))?;
+                let slot = match name {
+                    "x" => &mut args.env.ptrs.x,
+                    "weight" | "w" => &mut args.env.ptrs.weight,
+                    "xScale" | "xs" => &mut args.env.ptrs.x_scale,
+                    "weightScale" | "ws" => &mut args.env.ptrs.w_scale,
+                    "groupList" | "gl" => &mut args.env.ptrs.group_list,
+                    "y" => &mut args.env.ptrs.y,
+                    other => return Err(format!("--ptr: unknown pointer {other:?}")),
+                };
+                *slot = value & 127;
+                at += 2;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("gen plan: unexpected option {other:?}"));
+            }
+            other => {
+                args.positional.push(other.to_string());
+                at += 1;
+            }
+        }
+    }
+    args.env.physical_aic = aic.unwrap_or(args.env.available_core_num);
+    if args.env.available_core_num == 0 {
+        return Err("--cores must be positive (run_kernel throws on availableCoreNum<=0)".into());
+    }
+    Ok(args)
+}
+
+fn cmd_plan(argv: &[String]) -> i32 {
+    let args = match parse_plan_args(argv) {
+        Ok(a) => a,
+        Err(error) => {
+            eprintln!("gen plan: {error}");
+            return 2;
+        }
+    };
+    if args.all {
+        if !args.positional.is_empty() {
+            eprintln!("gen plan: --all takes no shape arguments");
+            return 2;
+        }
+        return plan_all(&args);
+    }
+    if args.positional.len() < 6 {
+        eprintln!(
+            "gen plan: want <E> <M> <K> <N> <gt> <fp16|bf16> <counts...>, or --all"
+        );
+        return 2;
+    }
+    let mut numbers = Vec::new();
+    for (index, token) in args.positional.iter().enumerate() {
+        if index == 5 {
+            continue;
+        }
+        match token.trim_end_matches(',').parse::<u32>() {
+            Ok(value) => numbers.push(value),
+            Err(_) => {
+                eprintln!("gen plan: {token:?} is not a number");
+                return 2;
+            }
+        }
+    }
+    let dtype = args.positional[5].as_str();
+    let bf = match dtype {
+        "bf16" | "bfloat16" => true,
+        "fp16" | "float16" | "half" => false,
+        other => {
+            eprintln!("gen plan: dtype must be fp16 or bf16, not {other:?}");
+            return 2;
+        }
+    };
+    let shape = dispatch::Shape {
+        e: numbers[0],
+        m: numbers[1],
+        k: numbers[2],
+        n: numbers[3],
+        group_list_type: numbers[4],
+        bf,
+        counts: numbers[5..].to_vec(),
+    };
+    let routed = match dispatch::route(&shape, &args.env) {
+        Ok(r) => r,
+        Err(error) => {
+            eprintln!("gen plan: run_kernel would throw: {error}");
+            return 1;
+        }
+    };
+    if args.json {
+        print!("{}", plan_json(&shape, &args, &routed));
+    } else {
+        print_plan(&shape, &args, &routed);
+    }
+    if routed.errors.is_empty() { 0 } else { 1 }
+}
+
+fn plan_all(args: &PlanArgs) -> i32 {
+    let points = dispatch::points();
+    let mut failures = 0;
+    if args.json {
+        let mut rows = Vec::new();
+        for point in &points {
+            match dispatch::route(&point.shape, &args.env) {
+                Ok(r) => {
+                    if !r.errors.is_empty() {
+                        failures += 1;
+                    }
+                    rows.push(format!(
+                        "    {{\"point\":{},\"gate\":{},\"line\":{},\"kernel\":{},\"grid\":{},\"errors\":{}}}",
+                        point.id,
+                        quote(&r.gate),
+                        r.line,
+                        quote(&r.kernel),
+                        r.grid,
+                        json_strings(&r.errors)
+                    ));
+                }
+                Err(error) => {
+                    failures += 1;
+                    rows.push(format!(
+                        "    {{\"point\":{},\"throws\":{}}}",
+                        point.id,
+                        quote(&error)
+                    ));
+                }
+            }
+        }
+        println!(
+            "{{\n  \"cores\": {},\n  \"points\": [\n{}\n  ]\n}}",
+            args.env.available_core_num,
+            rows.join(",\n")
+        );
+        return if failures == 0 { 0 } else { 1 };
+    }
+    println!(
+        "availableCoreNum={}  GetCoreNumAic()={}  pointers {}",
+        args.env.available_core_num,
+        args.env.physical_aic,
+        if args.misaligned { "misaligned (all &127 == 1)" } else { "64B-aligned (default)" }
+    );
+    println!(
+        "{:>3} {:>4} {:>5} {:>5} {:>5} {:>3} {:<5} {:<5} {:>5} {:<72} {:>5}",
+        "pt", "E", "M", "K", "N", "gt", "dt", "gate", "line", "kernel", "grid"
+    );
+    for point in &points {
+        let s = &point.shape;
+        match dispatch::route(s, &args.env) {
+            Ok(r) => {
+                if !r.errors.is_empty() {
+                    failures += 1;
+                }
+                println!(
+                    "{:>3} {:>4} {:>5} {:>5} {:>5} {:>3} {:<5} {:<5} {:>5} {:<72} {:>5}{}",
+                    point.id,
+                    s.e,
+                    s.m,
+                    s.k,
+                    s.n,
+                    s.group_list_type,
+                    s.dtype(),
+                    r.gate,
+                    r.line,
+                    r.kernel,
+                    r.grid,
+                    if r.errors.is_empty() { "" } else { "  ERROR" }
+                );
+                for error in &r.errors {
+                    println!("      !! {error}");
+                }
+            }
+            Err(error) => {
+                failures += 1;
+                println!("{:>3}  throws: {error}", point.id);
+            }
+        }
+    }
+    if failures == 0 { 0 } else { 1 }
+}
+
+fn print_plan(shape: &dispatch::Shape, args: &PlanArgs, r: &dispatch::Routed) {
+    let sum: u32 = shape.counts.iter().sum();
+    println!(
+        "shape  E={} M={} K={} N={} gt={} {}  counts[{}] sum={}{}",
+        shape.e,
+        shape.m,
+        shape.k,
+        shape.n,
+        shape.group_list_type,
+        shape.dtype(),
+        shape.counts.len(),
+        sum,
+        if shape.counts.len() as u32 != shape.e {
+            "  (WARN: counts length != E)"
+        } else if sum != shape.m {
+            "  (WARN: counts do not sum to M)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "env    availableCoreNum={}  GetCoreNumAic()={}  L1 budget guards {}",
+        args.env.available_core_num,
+        args.env.physical_aic,
+        if args.env.l1_guard { "on" } else { "OFF" }
+    );
+    let p = &args.env.ptrs;
+    println!(
+        "ptr    x&127={} weight&127={} xScale&127={} weightScale&127={} groupList&127={} y&127={}{}",
+        p.x,
+        p.weight,
+        p.x_scale,
+        p.w_scale,
+        p.group_list,
+        p.y,
+        if args.misaligned { "  (--misaligned)" } else { "  (default: judge buffers are >=64B aligned)" }
+    );
+    println!("\npredicate chain (source order, label from gen/CURRENT.md)");
+    for step in &r.trace {
+        let mark = match step.outcome {
+            dispatch::Outcome::Pass => "PASS",
+            dispatch::Outcome::Fail => "fail",
+            dispatch::Outcome::Note => "note",
+        };
+        let tags: Vec<&str> = step
+            .deps
+            .iter()
+            .map(|d| match d {
+                dispatch::Dep::Ptr => "[pointer]",
+                dispatch::Dep::Cores => "[cores]",
+                dispatch::Dep::Shape => "",
+            })
+            .collect();
+        println!(
+            "  {:<6} {:>4}  {mark}  {}{}",
+            step.label,
+            step.line,
+            step.detail,
+            if tags.is_empty() { String::new() } else { format!("  {}", tags.join(" ")) }
+        );
+    }
+    println!("\ngate   {} (kernel/kernel.asc:{})", r.gate, r.line);
+    println!("kernel {}", r.kernel);
+    if let Some(body) = &r.body {
+        println!("body   {body}");
+    }
+    println!("grid   {}   <- {}", r.grid, r.grid_how);
+    if let Some(p) = &r.plan {
+        // The AIV arms leave the cube tile fields at zero; printing them would
+        // suggest a tiling that does not exist.
+        if p.m0 != 0 {
+            println!(
+                "tiles  kp={} m0={} n0={} m0r={} n0r={} n0c={} k0={} kl={} nTiles={} rv={} wstride={}",
+                p.kp, p.m0, p.n0, p.m0r, p.n0r, p.n0c, p.k0, p.kl, p.n_tiles, p.rv, p.wstride
+            );
+        } else {
+            println!("tiles  none (AIV path); kp={} wstride={}", p.kp, p.wstride);
+        }
+    }
+    if let Some(v) = &r.vtiling {
+        println!(
+            "vtile  m={} k={} n={} e={} listType={} coreNum={} kc={} nb={}",
+            v.m, v.k, v.n, v.e, v.list_type, v.core_num, v.kc, v.nb
+        );
+    }
+    if let Some(bytes) = r.staging {
+        println!("stage  staging scratch {bytes} B ({:.1} MB)", bytes as f64 / 1.0e6);
+    }
+    if let Some((what, bytes)) = &r.extra_scratch {
+        println!("stage  {what} = {bytes} B ({:.1} MB)", *bytes as f64 / 1.0e6);
+    }
+    if r.packing.is_empty() {
+        println!("pack   none -- parameters travel as a Plan/VTiling by value");
+    } else {
+        println!("pack   uint32_t dims");
+        for field in &r.packing {
+            let margin = match field.margin() {
+                Some(margin) => format!("gate<={} margin {margin}", field.gate_max.unwrap()),
+                None => "gate: UNBOUNDED".to_string(),
+            };
+            println!(
+                "         {:<10} bit {:>2} w{:<2} value {:<6} fieldMax {:<6} {}{}",
+                field.name,
+                field.shift,
+                field.width,
+                field.value,
+                field.field_max(),
+                margin,
+                if field.fits() { "" } else { "   OVERFLOW" }
+            );
+        }
+        for field in &r.packing {
+            // `gt` is 1 bit against a 1-bit domain that run_kernel validates at
+            // 5826; it can never widen, so flagging it is noise.
+            if field.margin() == Some(0) && field.width > 1 {
+                println!(
+                    "warn   pack field {} has ZERO margin: the gate admits exactly what the field holds -- any widening overflows",
+                    field.name
+                );
+            }
+            if let Some(why) = field.incidental {
+                println!("warn   pack field {}: {why}", field.name);
+            }
+        }
+    }
+    for note in &r.notes {
+        println!("note   {note}");
+    }
+    let ptr_gates = r.gates_using_pointers();
+    if ptr_gates.is_empty() {
+        println!("ptrdep none -- every decision on this path was shape-only");
+    } else {
+        println!("ptrdep these decisions read device pointer values, not the shape:");
+        for step in &ptr_gates {
+            println!("         {} ({}) {}", step.label, step.line, step.detail);
+        }
+        // Do not silently pick an assumption: say what the other one gives.
+        let other = if args.misaligned {
+            dispatch::Ptrs::default()
+        } else {
+            dispatch::Ptrs::misaligned()
+        };
+        let label = if args.misaligned { "all six 64B-aligned" } else { "nothing aligned past a byte" };
+        let alt_env = dispatch::Env { ptrs: other, ..args.env };
+        match dispatch::route(shape, &alt_env) {
+            Ok(alt) => println!(
+                "         under the opposite assumption ({label}): gate {} ({}) -> {}, grid {}",
+                alt.gate, alt.line, alt.kernel, alt.grid
+            ),
+            Err(error) => println!("         under the opposite assumption ({label}): throws: {error}"),
+        }
+    }
+    let core_gates = r.gates_using_cores();
+    if !core_gates.is_empty() {
+        println!("coredep these decisions read availableCoreNum / GetCoreNumAic():");
+        for step in &core_gates {
+            println!("         {} ({}) {}", step.label, step.line, step.detail);
+        }
+    }
+    for error in &r.errors {
+        println!("ERROR  {error}");
+    }
+}
+
+fn quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_strings(items: &[String]) -> String {
+    format!(
+        "[{}]",
+        items.iter().map(|s| quote(s)).collect::<Vec<_>>().join(",")
+    )
+}
+
+fn plan_json(shape: &dispatch::Shape, args: &PlanArgs, r: &dispatch::Routed) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!(
+        "  \"shape\": {{\"e\":{},\"m\":{},\"k\":{},\"n\":{},\"groupListType\":{},\"dtype\":{},\"counts\":[{}]}},\n",
+        shape.e,
+        shape.m,
+        shape.k,
+        shape.n,
+        shape.group_list_type,
+        quote(shape.dtype()),
+        shape.counts.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+    ));
+    out.push_str(&format!(
+        "  \"env\": {{\"availableCoreNum\":{},\"physicalAic\":{},\"yL1Guard\":{},\"ptr\":{{\"x\":{},\"weight\":{},\"xScale\":{},\"weightScale\":{},\"groupList\":{},\"y\":{}}}}},\n",
+        args.env.available_core_num,
+        args.env.physical_aic,
+        args.env.l1_guard,
+        args.env.ptrs.x,
+        args.env.ptrs.weight,
+        args.env.ptrs.x_scale,
+        args.env.ptrs.w_scale,
+        args.env.ptrs.group_list,
+        args.env.ptrs.y
+    ));
+    out.push_str(&format!("  \"gate\": {},\n  \"line\": {},\n", quote(&r.gate), r.line));
+    out.push_str(&format!("  \"kernel\": {},\n", quote(&r.kernel)));
+    if let Some(body) = &r.body {
+        out.push_str(&format!("  \"body\": {},\n", quote(body)));
+    }
+    out.push_str(&format!("  \"grid\": {},\n  \"gridHow\": {},\n", r.grid, quote(&r.grid_how)));
+    if let Some(p) = &r.plan {
+        out.push_str(&format!(
+            "  \"plan\": {{\"kp\":{},\"m0\":{},\"n0\":{},\"m0r\":{},\"n0r\":{},\"n0c\":{},\"k0\":{},\"kl\":{},\"nTiles\":{},\"rv\":{},\"wstride\":{}}},\n",
+            p.kp, p.m0, p.n0, p.m0r, p.n0r, p.n0c, p.k0, p.kl, p.n_tiles, p.rv, p.wstride
+        ));
+    }
+    if let Some(v) = &r.vtiling {
+        out.push_str(&format!(
+            "  \"vtiling\": {{\"coreNum\":{},\"kc\":{},\"nb\":{}}},\n",
+            v.core_num, v.kc, v.nb
+        ));
+    }
+    if let Some(bytes) = r.staging {
+        out.push_str(&format!("  \"stagingBytes\": {bytes},\n"));
+    }
+    let fields: Vec<String> = r
+        .packing
+        .iter()
+        .map(|field| {
+            format!(
+                "    {{\"name\":{},\"shift\":{},\"width\":{},\"value\":{},\"fieldMax\":{},\"gateMax\":{},\"margin\":{},\"fits\":{}}}",
+                quote(field.name),
+                field.shift,
+                field.width,
+                field.value,
+                field.field_max(),
+                field.gate_max.map(|g| g.to_string()).unwrap_or_else(|| "null".into()),
+                field.margin().map(|m| m.to_string()).unwrap_or_else(|| "null".into()),
+                field.fits()
+            )
+        })
+        .collect();
+    out.push_str(&format!("  \"packing\": [\n{}\n  ],\n", fields.join(",\n")));
+    let chain: Vec<String> = r
+        .trace
+        .iter()
+        .map(|step| {
+            format!(
+                "    {{\"label\":{},\"line\":{},\"outcome\":{},\"detail\":{},\"pointerDependent\":{},\"coreDependent\":{}}}",
+                quote(&step.label),
+                step.line,
+                quote(match step.outcome {
+                    dispatch::Outcome::Pass => "pass",
+                    dispatch::Outcome::Fail => "fail",
+                    dispatch::Outcome::Note => "note",
+                }),
+                quote(&step.detail),
+                step.deps.contains(&dispatch::Dep::Ptr),
+                step.deps.contains(&dispatch::Dep::Cores)
+            )
+        })
+        .collect();
+    out.push_str(&format!("  \"chain\": [\n{}\n  ],\n", chain.join(",\n")));
+    out.push_str(&format!("  \"notes\": {},\n", json_strings(&r.notes)));
+    out.push_str(&format!("  \"errors\": {}\n", json_strings(&r.errors)));
+    out.push_str("}\n");
+    out
 }
 
 /// Reassemble from the manifest and compare against the pinned digest.
