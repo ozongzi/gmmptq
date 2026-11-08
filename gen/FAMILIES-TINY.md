@@ -76,7 +76,7 @@
 | --- | --- | --- |
 | H4 | 1186-1188, 1536-1541, 3499-3509 | int8 配对拆分：`ShiftLeft(x,8)` 再 `ShiftRight(x,8)` 取偶车道，裸 `ShiftRight(x,8)` 取奇车道——从一个 int16 里符号扩展地抽出两个 int8，不用 `GatherMask` |
 | H5 | 1210-1211, 1554, 3515-3537 | 乘积**绝不**在 int16 里累加（两个 16384 会溢出）。改为把两个 int16 乘积重打包进两个 int32 车道，用 `Add` 的重叠例外 `dst==src1, dstRepStride=src1RepStride=0` 归约——因为没有 int32 求和 intrinsic |
-| H6 | 1215, 1217, 1454-1455 | `WholeReduceSum` 的 `dstRepStride` 以**元素**计而 `srcRepStride` 以 **32B 块**计。所有相关缓冲尺寸都依赖这一点，弄错会静默覆盖 `scales` |
+| H6 | 1215, 1217, 1454-1455 | `WholeReduceSum` 的 `dstRepStride` 以**元素**计而 `srcRepStride` 以 **32B 块**计。所有相关缓冲尺寸都依赖这一点，弄错会静默覆盖 `scales`。**已查证（2026-11-08）**：f32 whole-reduce 的 `dstRepStride` 确实按元素计、合法最小值为 **1**。证据在容器的 CANN 头文件里——`aarch64-linux/asc/impl/basic_api/utils/kernel_utils_constants.h:244` 有 `DEFAULT_REDUCE_DST_REP_STRIDE = 1`；`dav_c220/kernel_operator_vec_reduce_impl.h:301` 中 CANN 自己的 `ReduceSumIntrinsicsImpl` 就以 `dstRepStride=1` 调用 `WholeReduceSum` 所降级到的同一条 intrinsic，而 `:328` 的第二级归约把第一级的 `repeatTimes` 个输出当**连续** f32 读。所以「用 `dstRepStride=1` 省掉 `Gather`+`CreateVecIndex`」是合法的，不是投机 |
 | H9 | 1294-1295, 1362-1363, 5302-5303 | `#pragma unroll for(k=0;k<8;++k) if(k<kCount)`——固定循环次数配谓词，展开是静态的而 `K` 保持运行时量 |
 | H10 | 1305-1310 | 每个 32 位 `SetValue` 打包两个 fp16/bf16 输出，末尾奇数元素用合法的 16 位存储 |
 | H11 | 5256-5283, 5419-5446 | `Load<Cap>`/`Store<Cap>`：递归的 2 的幂字节切分器，用可得的最宽自然对齐访问并退化到半宽。`Store` 绕过 D-cache |
