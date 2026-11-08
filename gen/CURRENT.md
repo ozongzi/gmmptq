@@ -191,3 +191,29 @@ Z 是真正的保险：`LeanPlanCube` 纯粹从 `m,k,n,e` 推导 `m0/n0/k0/kl/nT
 
 仍然没有覆盖的：`w11gv`（`GvBarrier`）、`w11gl`（合成 group list）、`w13xs`（xScale 前导 DMA）、
 `w4ldb`/`w4lda`（L1→L0 载入）。都是同一机制，加 Edit 即可。
+
+## fragment → 点 的对照必须由 op name 产生，不能由 dispatch 守卫推（2026-11-09）
+
+本文档和 `TARGETS.md` 此前记录的 fragment↔点 映射，**十条里错了两条**，而且两条都
+恰好落在被选中去做探针的那一族上：
+
+- `1471-long-narrow-dot.inc`（记为点 7/8）→ 实际服务 **0 个点**；点 7/8 跑
+  `3618-longdot-launch.inc` 的 `SearchLongDotCapacity11840033`。
+- `1231-tiny-reductions.inc`（记为点 3/5/6）→ 实际服务 **0 个点**；点 3/5/6 分别跑
+  `5103-tiny-expert-output.inc`、`5418-tiny-capacity-contract.inc`、
+  `5255-tiny-capacity-unrolled.inc`。
+
+原因：block 数会撞车（`IntegerProductLongNarrowDot` 的 `blocks=min(2*cores,N)` 和
+`longdot_capacity` 的 `<<<2>>>` 都给 2），而 dispatch 是多层守卫、命中取决于顺序。
+**权威表在 `kernel/TARGETS.md`**，由 `msprof --ai-core=on` 的 `Op Name` 实测。
+
+这对 generator 有一个直接后果：**`probe.rs` 里每个 `Probe` 的 `families` 字段是手写的
+散文，没有任何东西保证它说的点真的会执行被改的那行。** `no-reduce` 的 `families`
+写着「long-narrow-dot (7/8)」，而点 7/8 根本不进那个函数——探针照样「成功」应用了
+19 个站点，`every_probe_applies_with_its_declared_arity` 也照样通过，因为那条不变量
+只检查**字符串存在**，不检查**路径可达**。
+
+值得加的不变量：让 `families` 不再是散文，而是一个点集，并用一次实测的
+点→kernel 表（上面那张）交叉验证——或者至少让探针在应用后报告它改的函数名，
+由人去和 op name 对账。在那之前，**任何探针的 0 结果都必须先排除「那行没被执行」**。
+`no-reduce` 在点 7/8 上的 0 就是这么来的：数值上和预测的 0.16 µs≈0 一致，机制上完全不同。
