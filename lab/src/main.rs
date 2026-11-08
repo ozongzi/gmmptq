@@ -374,6 +374,30 @@ fn cmd_submit(
             if kernel.as_os_str() == "-" { "stdin".into() } else { kernel.display().to_string() }
         )));
     }
+    // An instrument that computes wrong answers by design must never reach the
+    // judge. Its marker lives only in comments, and `strip_source` below removes
+    // comments, so what crosses the wire carries no trace of it: the check has to
+    // read `raw`, and has to sit here, above `Judge::new`, so a refusal costs no
+    // quota slot.
+    if let Some(hit) = raw.lines().find(|l| l.contains(probe_marker())) {
+        return Err(Error::Other(format!(
+            "{} carries {} -- it is a measurement instrument and returns wrong \
+             answers by design, so it is not submittable.\n  {}\nRefused before \
+             a quota slot was spent.",
+            kernel.display(),
+            probe_marker(),
+            hit.trim()
+        )));
+    }
+    // Spin padding and the empty-kernel shortcut are deliberate tactics, not
+    // mistakes, so they are announced and allowed: refusing them would decide
+    // something that belongs to whoever is running the campaign. Worth saying
+    // out loud because only the *last* submission is reviewed by hand.
+    for needle in ["GetSystemCycle", "EmptyKernel"] {
+        if raw.contains(needle) {
+            eprintln!("note: source contains {needle} -- fine for a probe submission, but only the last submission of the contest is reviewed by hand");
+        }
+    }
     let judge = Judge::new(&lab.store, one);
     let local = local_times(local, judge.case_count()?)?;
     // What crosses the wire carries no comments and no blank lines. Stored and
@@ -634,4 +658,12 @@ mod tests {
         bad[8] = f64::NAN;
         assert!(local_times(&bad, 15).is_err());
     }
+}
+
+/// The banner the generator stamps on deliberately-wrong probe kernels.
+/// Duplicated from `gen::probe::MARKER` on purpose: `lab` does not depend on
+/// `gen`, and a submission guard that could be disabled by a missing crate
+/// would be no guard at all.
+fn probe_marker() -> &'static str {
+    "GMM_WRONG_ON_PURPOSE"
 }
