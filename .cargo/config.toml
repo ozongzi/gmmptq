@@ -1,0 +1,3 @@
+# `cargo lab <command>` runs the lab CLI from anywhere in the workspace.
+[alias]
+lab = "run --release --quiet -p lab --"

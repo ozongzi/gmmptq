@@ -1,0 +1,23 @@
+[Unit]
+Description=CANNJudge leaderboard submission monitor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=gmmlab
+# lab finds everything relative to its own executable: /opt/gmmlab/bin/lab
+# makes /opt/gmmlab the root, so the layout below it is the checkout's:
+#   /opt/gmmlab/secrets/accounts/ozongzi.json
+#   /opt/gmmlab/lab/data/          log (written)
+#   /opt/gmmlab/lab/gmmlab.db      cache (written)
+WorkingDirectory=/opt/gmmlab
+ExecStart=/opt/gmmlab/bin/lab watch --account ozongzi
+Restart=always
+RestartSec=15
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

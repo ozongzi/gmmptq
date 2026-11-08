@@ -1,0 +1,3 @@
+# The log is byte-exact: kernel sources and response bodies are named by
+# their sha, so no line-ending conversion may ever touch them.
+* -text

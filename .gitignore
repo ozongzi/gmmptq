@@ -1,0 +1,6 @@
+/target/
+# lab's cache, rebuilt from lab/data/ on the next run.
+lab/gmmlab.db*
+# Refresh lock and half-written credential files.
+secrets/accounts/*.lock
+secrets/accounts/*.new
