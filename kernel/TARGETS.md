@@ -62,7 +62,67 @@
 
 ## 逐点瓶颈性质
 
-### 点 11（+54.9，最大靶子）—— 每行开销受限，不是带宽
+### 点 11（+54.9，最大靶子）—— 未被掩盖的串行延迟，占 58–68%
+
+**已完成代码级诊断，结论明确。** 内核是 `SearchN1FixedLayoutSafe7100000<bf16,bf16,R=32,C=800>`
+（`kernel.asc:1145..1229`），40 blocks。
+
+**被否证的假设**：它并非每行发一次小 DMA。x 早就是**一次** `DataCopyPad`（1194 行，`blockCount=nr`、
+`blockLen=769`、**`srcStride=0`**），行在 GM 里本就连续。而且**摊平成单次宽 DMA 不可表达**：
+769 字节的 pitch 不是 32 的倍数，而下游每个 repeat stride 都按 32 字节块编码
+（`BinaryRepeatParams row{1,1,1,width/32,width/32,0}`、`srcRepStride = pairs/8 = 50`），
+摊平会让每行退化成 `repeat=1`，26 条指令取代现在的 1 条。非对齐只浪费 832/19994 = **4%**。
+
+**真实时间去向**：
+
+| 项 | µs | 占比 | 依据 |
+| --- | --- | --- | --- |
+| 40-block 启动地板 | 1.10 | 15% | 第零节实测表 |
+| `TPipe` 构造/析构 | 0.31 | 4% | 第一节实测 |
+| 向量发射 | 0.6–1.0 | 8–13% | 约 295 KB 发射量、1150 repeats、256 B/cycle @1.8 GHz |
+| DMA 传输 | 0.35–0.7 | 5–10% | 每核约 20 KB |
+| **未掩盖的串行延迟** | **4.3–5.0** | **58–68%** | 残差 |
+
+**成因**：
+
+1. `begin = M*blockIdx/cores`（1175）是连续分块，而 `1027/40 = 25.7` ⇒ 最大 `nr = 26 < R = 32`。
+   `for(m=first;m<last;m+=R)`（1192）对 **40 个 block 中的 38 个只跑一轮就退出**——没有第二批可供流水掩盖。
+   （只有 block 0 和 19 因专家边界落在第 1 行和第 512 行而跑两批。）UB 为之设计的 32 行批处理**从未被填满**。
+2. **全内核没有任何 `DataCachePreload`**，而直系兄弟 `BudgetStridedRowTiny`（1100-1108）与
+   `TinyCacheReduction`（1256-1275）都有。
+3. `weightScale` 的标量 GM 解引用（1190-1191）夹在 `GvBarrier<V_MTE2>`（1188）与 x 的 DMA（1194）之间，
+   把一个完整的标量 HBM 往返**串在最大那次传输前面**。
+4. weight 的 MTE2→V→MTE2 完整往返（1183-1188）在 x 的 DMA **之前**发出，而 x 大 26 倍、
+   且 weight 直到 1204 行才用到。
+5. x 的 DMA 地址只依赖 `blockIdx`（1175），**不依赖 groupList**，却被排在 groupList 扫描、
+   weight 往返、`ws` 读取之后。
+6. 40 个 block 各自跑完整的 `for(e=0;e<s.e;++e)` 调 `gg.GetValue(e)`（1179），
+   即 160 次对同一条 32 字节 cache line 的冷标量 GM 读。
+7. **30 条向量指令配 19 个硬同步**（10 个 `PipeBarrier<PIPE_V>` + 4 个 `GvBarrier` + 序章 5 个）。
+   尾部 1217→1222 是 5 个只处理 ≤26 元素的操作，之间夹着 5 次完整 V 流水排空。
+8. **`TPipe pipe;`（1153）声明了但 `InitBuffer` 从未被调用**——每个 buffer 都是手工摆放的
+   `LocalTensor(TPosition::VECCALC, offset, len)`。这个 `TPipe` 纯粹白付 0.31 µs。
+
+**UB 余量**：布局恰好 184672 字节 / 上限 188160 ⇒ **空余 3488 字节**。
+`static_assert(C%32==0 && R==32)`（1149）与 `static_assert(UB_BYTES==184672u)`（1152）都会硬失败，
+且后者比的是字面量，**所以不要改 `R` 或 `C`**——也没有收益，`R=32` 本就填不满，
+`C=800 = Up(769,32)` 由闸门 P 的 `K<=800` 决定。
+
+**不要做的事**：摊平 x 的 DMA（不可表达）；改 `R`/`C`；换数值方案（pair-split 与 `i8→f16→f32`
+发射量相同，各约 13–14 B/元素，而 f16 路线丢精度：`127*127 = 16129` 需 14 位尾数）；
+借 `RowDot` 的 weight-scale 路径（它用一次 DMA 加 `V_S`/`S_V` 往返换一次标量加载，更差）。
+`RowDot` 唯一值得借的是它的 groupList DMA（1414-1415、1418）。
+
+**改动阶梯**（预估合计 −2.2 到 −3.5 µs ⇒ 3.9–5.2 µs 对比 tbest 5.948，即点 11 从 45 分到 95–100 分，
+**总分 +3.3 到 +3.7**）：C1 去掉未使用的 `TPipe`；C3 groupList 改为一次 DMA 进 UB；
+C2 序章重排（预读 + x 的 DMA 提前投机发出 + weight 往返与 `ws` 读下移）；C5 把 `weightScale`
+折进 `scales`；C4 用 `dstRepStride=1` 的二级归约消掉 `Gather`/`CreateVecIndex`（**风险**，撞 H6 雷区）。
+
+C2 有个会静默出错的陷阱：`wl` 每个专家重新 DMA 一次，而向量单元仍在读 `weven`/`wodd`，
+重排后必须在**第二个**专家的 weight DMA 前保留 `V_MTE2` 栅栏（现在 1224 行只管 x）。
+弄错只会让**第 0 行和第 512 行**（即 block 0 和 19）算错，粗略检查发现不了。
+
+### 点 11 的旧分析（保留作对照）
 E4 M1027 K769 **N1**，counts `[1,511,0,515]`。走闸门 P → `SearchN1FixedLayoutSafe7100000<bf16,bf16,R=32,C=800>`，40 blocks。
 
 - 真实工作量：`1027 × 769` = 790 K MAC，微不足道
