@@ -70,6 +70,26 @@
 | `hoist_x` | `bool` | |
 | `full` | `bool` | `k==KC && n==NC` 的快速实例——**两个都生成**，运行时选，与现状一致 |
 
+## `P2TwoStripe` 的 `BANK_ROWS=48` 不是魔数，是 `RV/2`
+
+早先的 cube 风险清单把 `BANK_ROWS = 48u` 记为「与 `RV=96` 无关的魔数」。**不对（2026-11-08 查明）。**
+
+`P2TwoStripe` 把 bank 1 偏移到字面量 `accIBase[bank * BANK_ROWS * PITCH]`，而该区域按 `RV` 定尺寸。
+`48` 正好是 `RV=96` 的一半——96 行分成两个 48 行的 bank。所以：
+
+- `RV=96`：bank 1 落在区域内，正确
+- `RV=48`：bank 1 恰好落在末端
+- `RV=32`：bank 1 **越界写进 `accF`**
+
+这就是 `static_assert(!P2TwoStripe || (BM==96 && BN==128 && BK==256 && RV==96 …))` 的实质理由，
+它不是保守而是正确性边界。**任何改点 2 的 BM/RV 的尝试都必须带 `P2TwoStripe=false`**，
+连带丢掉核置换与双 bank 的 MTE3 流水——所以「改 BM」与「保策略」无法同时成立，
+对比实验必须加一个同 BM、仅关策略的控制组才能归因。
+
+另外 `PreXS=true` 有独立的 `static_assert(!PreXS || (… BM>32u …))`。
+
+generator 若要参数化这一族，`BANK_ROWS` 必须由 `RV` 推导（`RV/2`）而不是写死。
+
 ## 必须保活的手调痕迹
 
 | # | 行 | 内容 |
