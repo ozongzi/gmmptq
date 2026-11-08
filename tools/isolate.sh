@@ -1,9 +1,12 @@
 #!/bin/bash
-# mkiso.sh <base.asc> <ref-with-probe.asc> <point 1..15> <out.asc>
+# isolate.sh <base.asc> <ref-with-probe.asc> <point 0..15> <out.asc> [own ticks]
 # Splice the proven spin instrument (GmmProbeSpin / kGmmProbeTicks / GmmProbePoint)
 # into a kernel that lacks it, isolating one test point: every OTHER point gets
 # 50.00 ms of pure spin appended after its real kernel, so the judge's total score
 # is (14 * a known constant + s_point) / 15 and s_point falls out exactly.
+# Point 0 spins every point: the reusable calibration run.  The 5th argument puts a
+# known spin on the isolated point ITSELF, which is what tools/isosolve3.sh needs to
+# separate our own time from that point tbest.
 # Byte-exact on the base: head/tail only, never sed over the whole file -- the base
 # has mixed CRLF/LF and must survive unchanged.  Seams are located on a CR-stripped
 # index copy, which has the same line numbering.
