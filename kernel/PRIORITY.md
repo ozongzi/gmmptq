@@ -215,3 +215,38 @@ cube 路径的点按 `N mod 128` 劈成两半——N 对齐的点 1（N=1024）�
 
 点 9 的高方差是 2026-11-08 验收生成 kernel 时发现的：单轮 A/B 报出 +29.1% 的「回归」，
 重测 3 轮后变成生成版**更快**（16.96 vs 18.44）。**单轮读数在点 9 上毫无意义。**
+
+## 未完成项清单（2026-11-09）
+
+### 第 1 级 复刻 OJ —— 测时已复现，判定有一个未验证的推断
+
+**已复现**：测时口径（算子级 `msprof op`，`--iters 300 --warm-up=60`），20 组验证比值 1.041。
+
+**未验证**：**容差 1e-3 是我们自己 `fixture/src/verify.rs` 里的阈值，不是判题器的。**
+关于判题器容差只知下界：tp1/tp4/tp15 在判题器上 PASS 而其 fp16 相对误差达 **9.766e-4**
+⇒ 判题器容差 **≥ 9.8e-4**。上界未知——从未提交过带 1 ULP 误差的 bf16 kernel。
+
+所以「bf16 必须逐位精确」是从**我们自己的验证器**推出的，不是测出的。
+一次提交即可定（提交 `~/gmm-rebuild/p12hs` 看是否 Pass）。
+对半 staging 已无意义（性能只值 0.4%），但对 **VDEQF16 在 bf16 点上**很要紧——它在 AIV 关键腿上。
+
+### 第 2 级 generator —— 路由已是数据，kernel body 还不是
+
+| 项 | 状态 |
+| --- | --- |
+| `emit --profile verbatim` 字节级复现 | 完成 |
+| `gen plan` 15 点路由 + 50 测试 | 完成 |
+| `emit --profile final`：`run_kernel` 由 `plan` 用的同一张表生成（39 闸门） | 完成 |
+| 生成 kernel 15/15 AC、全 15 点对平 ±4% | 完成 |
+| 加闸门 = 改 14 行数据；`plan --what-if` 打印可粘贴表项 | 完成 |
+| 位打包守卫（拒绝让维度静默别名的闸门） | 完成 |
+| 合规由生成时保证（grep 10 命中 → 0） | 完成 |
+| `--profile instrument` 四个分解探针 | 完成 |
+| **kernel body 参数化** | **未做——全部仍是 verbatim 片段** |
+| `lab submit` 拒绝带 `GMM_WRONG_ON_PURPOSE` 的探针 kernel | 未做 |
+| 闸门 R 的 `selectedPitch`/`selectedUb` 算术与 `Ctx::new` 的交叉校验 | 未做（只校验了比较常数） |
+| `halve-k` 覆盖 tiny/longdot/outer/N==1 四族 | 未做 |
+
+**body 未参数化的实际影响**：新点若只需新的 tile 配置，是可表达的
+（`ConfigureCubeFullK<BM,BN,BK,RV,…>` 就在闸门的启动表达式里）；
+但若需要一个新的算法家族，仍得手写。
