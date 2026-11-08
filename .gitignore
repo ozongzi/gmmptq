@@ -4,3 +4,6 @@ lab/gmmlab.db*
 # Refresh lock and half-written credential files.
 secrets/accounts/*.lock
 secrets/accounts/*.new
+
+# cmd.exe ">nul" redirects land here when run from git bash
+nul
