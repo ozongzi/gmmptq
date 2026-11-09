@@ -1,5 +1,5 @@
 [workspace]
-members = ["lab", "fixture", "gen"]
+members = ["lab", "fixture"]
 resolver = "3"
 
 [profile.release]

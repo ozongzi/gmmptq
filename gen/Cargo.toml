@@ -1,9 +1,0 @@
-[package]
-name = "gen"
-version = "0.1.0"
-edition = "2024"
-
-# No dependencies, on purpose -- same reason as `fixture`. This emits one
-# self-contained Ascend C translation unit and must be buildable on a bare
-# checkout with no crates.io access.
-[dependencies]
