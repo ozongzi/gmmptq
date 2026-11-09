@@ -10,6 +10,7 @@
 //!     cargo run -p gen -- check-chunks
 //!
 //! Zero dependencies, so the argument parsing is by hand -- same as `fixture`.
+mod audit;
 mod body;
 mod cascade;
 mod chunks;
@@ -37,6 +38,7 @@ fn usage() -> ! {
          emit --profile spin --isolate <point|0> [--ticks N] [--own-ticks N] -o <path>\n\
          \x20                                   score hiding: every other point spins 50.00 ms\n\
          bodies                              the registered body slots and implementations\n\
+         audit <file>                        does this kernel match the published cases?\n\
          check-chunks [-v]                   verify the verbatim reassembly's sha256\n\
          plan <E> <M> <K> <N> <gt> <fp16|bf16> <counts...>\n\
          plan --all                          the 15 published points, one line each\n\
@@ -122,6 +124,7 @@ fn main() {
             print!("{}", body::listing());
             0
         }
+        Some("audit") => cmd_audit(&argv),
         Some("classes") => not_yet(
             "classes",
             "the shape classifier is milestone 1; today's kernel dispatches by equality.",
@@ -129,6 +132,43 @@ fn main() {
         _ => usage(),
     };
     std::process::exit(code)
+}
+
+/// `gen audit <file>`: report banned constructs and per-case shape gates.
+///
+/// Exits 1 when the file is not clean, so it can gate a candidate before
+/// anyone spends a submission or lifts a body out of it.
+fn cmd_audit(argv: &[String]) -> i32 {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for arg in argv.iter().skip(2) {
+        if arg.starts_with('-') {
+            eprintln!("gen audit: unexpected option {arg:?}; usage: gen audit <file>...");
+            return 2;
+        }
+        paths.push(PathBuf::from(arg));
+    }
+    if paths.is_empty() {
+        eprintln!("gen audit: <file> is required");
+        return 2;
+    }
+    let mut worst = 0;
+    for path in &paths {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(error) => {
+                eprintln!("gen audit: {}: {error}", path.display());
+                worst = worst.max(1);
+                continue;
+            }
+        };
+        let report = audit::report(&text);
+        println!("== {}", path.display());
+        print!("{}", report.render());
+        if !report.clean() {
+            worst = worst.max(1);
+        }
+    }
+    worst
 }
 
 /// Generate a translation unit. Only `verbatim` produces bytes today.

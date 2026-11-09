@@ -591,13 +591,13 @@ mod tests {
                 "body {} carries an empty kernel",
                 b.name
             );
-            for shape in per_case_shape_gates() {
-                assert!(
-                    !squash_spaces(&text).contains(&shape),
-                    "body {} carries the per-case shape gate {shape:?}",
-                    b.name
-                );
-            }
+            let findings = crate::audit::scan(&text, 2);
+            assert!(
+                findings.is_empty(),
+                "body {} carries a per-case shape gate: {:?}",
+                b.name,
+                findings
+            );
         }
     }
 
@@ -619,36 +619,28 @@ mod tests {
         ];
         for (what, bytes) in units {
             let text = String::from_utf8(bytes).expect("utf8");
-            let flat = squash_spaces(&text);
-            assert_eq!(
-                text.matches("Case9EmptyKernel").count(),
-                0,
-                "{what} carries Case9EmptyKernel"
+            let report = crate::audit::report(&text);
+            // A per-case gate is forbidden in every profile: it is a statement
+            // about what the code does, not about what the file is for.
+            assert!(
+                report.findings.is_empty(),
+                "{what} carries a per-case gate:\n{}",
+                report.render()
             );
-            for shape in per_case_shape_gates() {
+            assert_eq!(report.host_to_host_copies, 0, "{what} reads an input tensor on the host");
+            // The banned *constructs* are a submission question, so the spin
+            // profile is allowed exactly the two that make it a spin profile
+            // -- and nothing else, which is what this spells out.
+            let allowed: &[&str] =
+                if what == "spin" { &["GetSystemCycle", "GmmProbeSpin"] } else { &[] };
+            for (needle, n) in &report.banned {
                 assert!(
-                    !flat.contains(&shape),
-                    "{what} carries the per-case shape gate {shape:?}"
+                    allowed.contains(&needle.as_str()),
+                    "{what} carries {needle} x{n}, which that profile may not have:\n{}",
+                    report.render()
                 );
             }
         }
-    }
-
-    /// The fifteen published shapes, as the conjunction a per-case gate would
-    /// have to spell. Built from the point table so a new point is covered
-    /// without anyone remembering to add it here.
-    fn per_case_shape_gates() -> Vec<String> {
-        dispatch::points()
-            .iter()
-            .map(|p| {
-                let s = &p.shape;
-                format!("M=={}&&K=={}&&N=={}", s.m, s.k, s.n)
-            })
-            .collect()
-    }
-
-    fn squash_spaces(text: &str) -> String {
-        text.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     /// The fold body must really be a different implementation, and must not

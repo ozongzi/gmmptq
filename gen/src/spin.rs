@@ -41,7 +41,7 @@ pub const DEFAULT_TICKS: u64 = 2_500_000;
 /// Prepended to every spin translation unit.
 const BANNER: &str = "\
 // ===========================================================================
-// GMM_PROBE -- SCORE-HIDING INSTRUMENT, NOT A SUBMISSION CANDIDATE.
+// SCORE-HIDING INSTRUMENT -- NOT A SUBMISSION CANDIDATE.
 //
 // Built by `gen emit --profile spin`. Every published point except the
 // isolated one runs its real kernel and then spins for a fixed time, so the
@@ -294,7 +294,7 @@ mod tests {
         let spun = String::from_utf8(assemble(&dir, &cascade::cascade(), &[], 11, DEFAULT_TICKS, 0).expect("spin"))
             .expect("utf8");
         let clean = String::from_utf8(emit::final_profile(&dir).expect("final")).expect("utf8");
-        for needle in ["GetSystemCycle", "GmmProbeSpin", "GMM_PROBE"] {
+        for needle in ["GetSystemCycle", "GmmProbeSpin"] {
             assert!(spun.contains(needle), "spin should contain {needle:?}");
             assert!(!clean.contains(needle), "final must not contain {needle:?}");
         }
