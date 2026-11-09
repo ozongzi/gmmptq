@@ -10,12 +10,14 @@
 //!     cargo run -p gen -- check-chunks
 //!
 //! Zero dependencies, so the argument parsing is by hand -- same as `fixture`.
+mod body;
 mod cascade;
 mod chunks;
 mod dispatch;
 mod emit;
 mod probe;
 mod sha256;
+mod spin;
 mod tmpl;
 mod whatif;
 
@@ -28,8 +30,13 @@ fn usage() -> ! {
         "gen <command>\n\
          \n\
          emit --profile <name> [-o <path>]   generate kernel.asc (stdout without -o)\n\
+         emit --profile final --pick <point>=<body>[,…] [-o <path>]\n\
+         \x20                                   choose a named body implementation per point\n\
          emit --profile instrument --probe <name> -o <path>\n\
          \x20                                   a WRONG-ON-PURPOSE measurement kernel\n\
+         emit --profile spin --isolate <point|0> [--ticks N] [--own-ticks N] -o <path>\n\
+         \x20                                   score hiding: every other point spins 50.00 ms\n\
+         bodies                              the registered body slots and implementations\n\
          check-chunks [-v]                   verify the verbatim reassembly's sha256\n\
          plan <E> <M> <K> <N> <gt> <fp16|bf16> <counts...>\n\
          plan --all                          the 15 published points, one line each\n\
@@ -56,7 +63,8 @@ fn usage() -> ! {
          \x20         instrument  a decomposition probe: final with one dimension or DMA\n\
          \x20                     extent halved. WRONG ANSWERS BY DESIGN, never submit\n\
          \x20         probe       the GMM_ASK hidden-point content oracle (not implemented)\n\
-         \x20         spin        the spin-to-a-fixed-time kernels     (not implemented)\n"
+         \x20         spin        score hiding: the real dispatch, then a fixed spin on\n\
+         \x20                     every published point but the isolated one\n"
     );
     std::process::exit(2)
 }
@@ -110,6 +118,10 @@ fn main() {
         Some("emit") => cmd_emit(&argv),
         Some("check-chunks") => cmd_check_chunks(&argv),
         Some("plan") => cmd_plan(&argv),
+        Some("bodies") => {
+            print!("{}", body::listing());
+            0
+        }
         Some("classes") => not_yet(
             "classes",
             "the shape classifier is milestone 1; today's kernel dispatches by equality.",
@@ -124,12 +136,56 @@ fn cmd_emit(argv: &[String]) -> i32 {
     let mut profile: Option<Profile> = None;
     let mut out: Option<PathBuf> = None;
     let mut which_probe: Option<String> = None;
+    let mut pick: Option<String> = None;
+    let mut isolate: Option<u32> = None;
+    let mut ticks: u64 = spin::DEFAULT_TICKS;
+    let mut own_ticks: u64 = 0;
     let mut at = 2;
     while at < argv.len() {
         match argv[at].as_str() {
             "--probe" => {
                 let Some(name) = argv.get(at + 1) else { usage() };
                 which_probe = Some(name.clone());
+                at += 2;
+            }
+            "--pick" => {
+                let Some(spec) = argv.get(at + 1) else { usage() };
+                // Repeating --pick accumulates rather than overwriting, so a
+                // scripted sweep can append one flag per point.
+                pick = Some(match pick {
+                    Some(prev) => format!("{prev},{spec}"),
+                    None => spec.clone(),
+                });
+                at += 2;
+            }
+            "--isolate" => {
+                let Some(raw) = argv.get(at + 1) else { usage() };
+                match raw.parse::<u32>() {
+                    Ok(n) => isolate = Some(n),
+                    Err(_) => {
+                        eprintln!("gen emit: --isolate wants a point number, or 0 for the \
+                                   all-spin calibration run; got {raw:?}");
+                        return 2;
+                    }
+                }
+                at += 2;
+            }
+            "--ticks" | "--own-ticks" => {
+                let flag = argv[at].clone();
+                let Some(raw) = argv.get(at + 1) else { usage() };
+                match raw.parse::<u64>() {
+                    Ok(n) => {
+                        if flag == "--ticks" {
+                            ticks = n;
+                        } else {
+                            own_ticks = n;
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("gen emit: {flag} wants a tick count (1 tick = 20 ns); got {raw:?}");
+                        return 2;
+                    }
+                }
                 at += 2;
             }
             "--profile" | "-p" => {
@@ -164,17 +220,53 @@ fn cmd_emit(argv: &[String]) -> i32 {
         }
     };
 
+    // `--pick` is resolved and fully validated before any profile runs, so an
+    // unregistered point, body or slot refuses with a reason instead of
+    // emitting a kernel that quietly ignored the flag.
+    let picks = match pick.as_deref() {
+        None => Vec::new(),
+        Some(spec) => match body::parse_picks(spec, &dispatch::Env::default()) {
+            Ok(picks) => picks,
+            Err(error) => {
+                eprintln!("gen emit: {error}");
+                return 2;
+            }
+        },
+    };
+    if !picks.is_empty() && !matches!(profile, Profile::Final | Profile::Spin) {
+        eprintln!(
+            "gen emit: --pick applies to --profile final and --profile spin, not {}",
+            profile.name()
+        );
+        return 2;
+    }
+
     match profile {
-        Profile::Verbatim => {}
-        Profile::Final => return emit_final(&dir, out.as_deref()),
+        Profile::Verbatim => {
+            if !picks.is_empty() {
+                eprintln!("gen emit: --profile verbatim is the milestone 0 reference; it takes no --pick");
+                return 2;
+            }
+        }
+        Profile::Final => return emit_final(&dir, out.as_deref(), &picks),
         Profile::Instrument => {
             return emit_instrument(&dir, out.as_deref(), which_probe.as_deref());
         }
-        Profile::Probe | Profile::Spin => {
+        Profile::Spin => {
+            let Some(isolate) = isolate else {
+                eprintln!(
+                    "gen emit --profile spin: --isolate <point> is required \
+                     (--isolate 0 spins every point: the reusable calibration run)"
+                );
+                return 2;
+            };
+            return emit_spin(&dir, out.as_deref(), &picks, isolate, ticks, own_ticks);
+        }
+        Profile::Probe => {
             return not_yet(
-                &format!("--profile {}", profile.name()),
-                "the probe and spin kernels become generator output in milestone 1; \
-                 until then use the ones already in the verbatim fragments.",
+                "--profile probe",
+                "the GMM_ASK content oracle becomes generator output in milestone 1; \
+                 until then use the one already in the verbatim fragments.",
             );
         }
     }
@@ -241,9 +333,16 @@ fn cmd_emit(argv: &[String]) -> i32 {
 /// milestone 1..N), so there is no sha256 to compare against. What *is*
 /// checked, before a byte is written, is that every gate's shape fits its
 /// launcher's packed `dims` fields -- see `emit::run_kernel`.
-fn emit_final(dir: &std::path::Path, out: Option<&std::path::Path>) -> i32 {
+fn emit_final(
+    dir: &std::path::Path,
+    out: Option<&std::path::Path>,
+    picks: &[body::Pick],
+) -> i32 {
     let nodes = cascade::cascade();
-    let bytes = match emit::assemble(dir, &nodes) {
+    for p in picks {
+        eprintln!("pick     point {:<3} body {:<16} {}", p.point, p.body.name, p.body.what);
+    }
+    let bytes = match emit::final_with_picks(dir, picks) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("gen emit --profile final: {error}");
@@ -276,6 +375,66 @@ fn emit_final(dir: &std::path::Path, out: Option<&std::path::Path>) -> i32 {
             }
         }
     }
+    0
+}
+
+/// `--profile spin --isolate <point>`: the real dispatch, then a fixed spin on
+/// every published point but one.
+///
+/// Like `instrument`, this refuses stdout: a spin kernel one shell redirect
+/// away from a submission is the mistake this profile exists to make visible.
+fn emit_spin(
+    dir: &std::path::Path,
+    out: Option<&std::path::Path>,
+    picks: &[body::Pick],
+    isolate: u32,
+    ticks: u64,
+    own_ticks: u64,
+) -> i32 {
+    let overrides = match body::overrides(dir, picks) {
+        Ok(o) => o,
+        Err(error) => {
+            eprintln!("gen emit --profile spin: {error}");
+            return 1;
+        }
+    };
+    let bytes = match spin::assemble(dir, &overrides, isolate, ticks, own_ticks) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("gen emit --profile spin: {error}");
+            return 1;
+        }
+    };
+    let Some(path) = out else {
+        eprintln!(
+            "gen emit --profile spin: -o <path> is required; a spin kernel is never written \
+             to stdout"
+        );
+        return 2;
+    };
+    if let Err(error) = std::fs::write(path, &bytes) {
+        eprintln!("gen emit: {}: {error}", path.display());
+        return 1;
+    }
+    for p in picks {
+        eprintln!("pick     point {:<3} body {:<16} {}", p.point, p.body.name, p.body.what);
+    }
+    if isolate == 0 {
+        eprintln!(
+            "spin     every point: the all-spin calibration run, which measures the sum of \
+             the spun scores once for every later isolation"
+        );
+    } else {
+        eprintln!("spin     every point but {isolate}, at {ticks} ticks = {:.2} ms", ticks as f64 * 2e-5);
+        eprintln!(
+            "point {isolate:<2} {} ticks of its own = {:.2} us{}",
+            own_ticks,
+            own_ticks as f64 * 0.02,
+            if own_ticks == 0 { " (no spin kernel launched for it)" } else { "" }
+        );
+    }
+    eprintln!("WARNING  {} is a SCORE-HIDING instrument, not a submission candidate:", path.display());
+    eprintln!("WARNING  its times are not ours. The answers are correct and every point is AC.");
     0
 }
 

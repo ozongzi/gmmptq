@@ -87,10 +87,45 @@ pub fn run_kernel(nodes: &[Node]) -> Result<String, String> {
 /// The whole translation unit: 44 verbatim fragments plus the generated
 /// cascade, spliced at the position the manifest gives `5814-run-kernel.inc`.
 pub fn assemble(dir: &Path, nodes: &[Node]) -> Result<Vec<u8>, String> {
+    assemble_with(dir, nodes, &[])
+}
+
+/// `assemble`, with selected bodies substituted for the fragments that hold
+/// them (`crate::body::overrides`).
+///
+/// An empty `overrides` is the same code path as `assemble`, so the body layer
+/// cannot change an un-picked emit: the loop simply finds no fragment to
+/// replace. Every override must match a fragment the manifest lists -- an
+/// override for a fragment that is not emitted would be a silently dropped
+/// `--pick`, which is the one failure this layer must not have.
+pub fn assemble_with(
+    dir: &Path,
+    nodes: &[Node],
+    overrides: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
     let body = run_kernel(nodes)?;
     let fragments = chunks::load(dir)?;
     if !fragments.iter().any(|f| f.name == RUN_KERNEL_FRAGMENT) {
         return Err(format!("{} lists no {RUN_KERNEL_FRAGMENT}", dir.display()));
+    }
+    for (name, _) in overrides {
+        if !fragments.iter().any(|f| &f.name == name) {
+            return Err(format!(
+                "a selected body replaces fragment {name:?}, which {} does not list",
+                dir.display()
+            ));
+        }
+        if OMITTED_IN_FINAL.iter().any(|(omitted, _)| omitted == name) {
+            return Err(format!(
+                "a selected body replaces fragment {name:?}, which --profile final omits"
+            ));
+        }
+        if name == RUN_KERNEL_FRAGMENT {
+            return Err(format!(
+                "a selected body replaces {RUN_KERNEL_FRAGMENT}, which is generated from the \
+                 cascade; add a gate instead"
+            ));
+        }
     }
     let mut out = Vec::new();
     for fragment in &fragments {
@@ -98,6 +133,10 @@ pub fn assemble(dir: &Path, nodes: &[Node]) -> Result<Vec<u8>, String> {
             out.extend_from_slice(body.as_bytes());
         } else if OMITTED_IN_FINAL.iter().any(|(name, _)| *name == fragment.name) {
             continue;
+        } else if let Some((_, text)) =
+            overrides.iter().find(|(name, _)| *name == fragment.name)
+        {
+            out.extend_from_slice(text);
         } else {
             out.extend_from_slice(&fragment.bytes);
         }
@@ -121,6 +160,12 @@ pub fn assemble(dir: &Path, nodes: &[Node]) -> Result<Vec<u8>, String> {
 /// `--profile final` for the shipped cascade.
 pub fn final_profile(dir: &Path) -> Result<Vec<u8>, String> {
     assemble(dir, &cascade::cascade())
+}
+
+/// `--profile final --pick …`: the shipped cascade with chosen bodies.
+pub fn final_with_picks(dir: &Path, picks: &[crate::body::Pick]) -> Result<Vec<u8>, String> {
+    let overrides = crate::body::overrides(dir, picks)?;
+    assemble_with(dir, &cascade::cascade(), &overrides)
 }
 
 /// The hand-written `run_kernel` the generated one replaces, for diffing.
@@ -378,6 +423,130 @@ mod tests {
         // assert that rather than silently skipping a comparison.
         assert_eq!(fragments.last().map(|f| f.name.as_str()), Some(RUN_KERNEL_FRAGMENT));
         assert!(generated.ends_with(b"}\n\n"), "lost the file ending");
+    }
+
+    /// The body layer must be inert until something is picked: an emit with no
+    /// `--pick` goes down the same path and produces the same bytes.
+    #[test]
+    fn no_picks_is_the_same_bytes_as_a_plain_assemble() {
+        let dir = chunks::chunks_dir().expect("gen/chunks");
+        let nodes = cascade::cascade();
+        let plain = assemble(&dir, &nodes).expect("assemble");
+        let with_none = assemble_with(&dir, &nodes, &[]).expect("assemble_with");
+        assert!(plain == with_none, "the body layer changed an un-picked emit");
+        // …and picking the registered default is byte-identical too, because
+        // the default body's source *is* the fragment.
+        let env = Env::default();
+        let picks = crate::body::parse_picks("11=n1-wholereduce", &env).expect("pickable");
+        let defaulted = final_with_picks(&dir, &picks).expect("final with default pick");
+        assert!(plain == defaulted, "picking the default changed the output");
+    }
+
+    /// A pick replaces its own fragment and leaves every other byte alone, so
+    /// a measured difference can only come from the body that was chosen.
+    #[test]
+    fn a_pick_changes_only_its_own_fragment() {
+        let dir = chunks::chunks_dir().expect("gen/chunks");
+        let nodes = cascade::cascade();
+        let env = Env::default();
+        let picks = crate::body::parse_picks("11=n1-fold", &env).expect("pickable");
+        let picked = final_with_picks(&dir, &picks).expect("final with fold");
+        let plain = assemble(&dir, &nodes).expect("assemble");
+        assert!(picked != plain, "the fold pick changed nothing");
+
+        // Rebuild by hand: every fragment verbatim but 1142, which is the
+        // fold's source. Anything else differing is a splice bug.
+        let fold = crate::body::source_of(&dir, crate::body::body("n1-fold").unwrap())
+            .expect("fold source");
+        let body = run_kernel(&nodes).expect("emits");
+        let mut want: Vec<u8> = Vec::new();
+        for fragment in &chunks::load(&dir).expect("fragments") {
+            if fragment.name == RUN_KERNEL_FRAGMENT {
+                want.extend_from_slice(body.as_bytes());
+            } else if OMITTED_IN_FINAL.iter().any(|(n, _)| *n == fragment.name) {
+                continue;
+            } else if fragment.name == "1142-n1-fixed-layout-safe.inc" {
+                want.extend_from_slice(&fold);
+            } else {
+                want.extend_from_slice(&fragment.bytes);
+            }
+        }
+        assert!(picked == want, "a pick touched something other than its own fragment");
+    }
+
+    /// An override naming a fragment the manifest does not emit is a refusal,
+    /// never a quietly dropped selection.
+    #[test]
+    fn an_override_for_a_fragment_that_is_not_emitted_is_refused() {
+        let dir = chunks::chunks_dir().expect("gen/chunks");
+        let nodes = cascade::cascade();
+        for (name, why) in [
+            ("no-such-fragment.inc", "does not list"),
+            ("5731-probe-ask.inc", "omits"),
+            (RUN_KERNEL_FRAGMENT, "generated from the cascade"),
+        ] {
+            let error = assemble_with(&dir, &nodes, &[(name.to_string(), b"x".to_vec())])
+                .expect_err("must refuse");
+            assert!(error.contains(why), "{name}: {error}");
+        }
+    }
+
+    /// The 14 November hook, end to end: a new shape is served by registering
+    /// one gate in the table. Nothing about `kernel.asc`, the MANIFEST or the
+    /// fragments changes -- `route` finds the new gate and `emit` carries it.
+    #[test]
+    fn a_new_shape_is_served_by_registering_one_gate() {
+        let dir = chunks::chunks_dir().expect("gen/chunks");
+        let manifest_before = chunks::read_manifest(&dir).expect("manifest");
+
+        // A shape none of the fifteen has, which today falls to the cube
+        // fallback: E2 M64 K256 N256, bf16, grouped.
+        let newcomer = dispatch::Shape {
+            e: 2, m: 64, k: 256, n: 256, group_list_type: 1, bf: true,
+            counts: vec![32, 32],
+        };
+        let env = Env::default();
+        let before = dispatch::route(&newcomer, &env).expect("routes today");
+
+        // Position *is* the priority in this cascade, so a new gate has to go
+        // ahead of whatever would otherwise catch the shape -- here gate X,
+        // which claims it today. Appending it at the end would route nothing,
+        // which is the mistake `plan --what-if --after <label>` exists to
+        // show before anyone compiles.
+        let mut nodes = cascade::cascade();
+        nodes.insert(
+            0,
+            Node::Gate(
+                Gate::new("P16", 9001)
+                    .p(vec![
+                        Expr::Cmp(Q::E, Op::Eq, R::Const(2)),
+                        Expr::Cmp(Q::K, Op::Eq, R::Const(256)),
+                        Expr::Cmp(Q::N, Op::Eq, R::Const(256)),
+                        Expr::Flag(Q::Bf),
+                    ])
+                    .l("SearchCubeCompact4700003<bfloat16_t,bfloat16_t><<<p.cores,nullptr,stream>>>(x,weight,xScale,weightScale,groupList,y,p);return;"),
+            ),
+        );
+
+        // The router picks it up at the position it was inserted…
+        let after = dispatch::route_with(&nodes, &newcomer, &env).expect("routes");
+        assert_eq!(after.gate, "P16", "the new gate did not win the new shape");
+        assert_ne!(before.gate, "P16");
+
+        // …the emitted file carries it…
+        let text = run_kernel(&nodes).expect("emits");
+        let emitted = parse(&text);
+        assert!(emitted.iter().any(|g| g.label == "P16"), "the new gate is not emitted");
+
+        // …no published point is re-routed…
+        for point in dispatch::points() {
+            let was = dispatch::route(&point.shape, &env).expect("routes");
+            let now = dispatch::route_with(&nodes, &point.shape, &env).expect("routes");
+            assert_eq!(was.gate, now.gate, "point {} was re-routed", point.id);
+        }
+
+        // …and nothing on disk had to move.
+        assert_eq!(manifest_before, chunks::read_manifest(&dir).expect("manifest"));
     }
 
     /// The generated body must at least be brace-balanced and end the function.

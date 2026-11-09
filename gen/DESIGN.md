@@ -116,6 +116,26 @@ gen plan --what-if --tiles BM,BN,BK,RV[,prefetch,singleL0] [--launcher <名>] [-
 (1) 现在走哪条闸门、(2) 加上后走哪条、(3) 位打包是否放得下、(4) 它会生成的 C++、
 (5) **可直接粘进 `cascade::cascade()` 的 Rust 表项**、(6) 现有 15 点是否被改道。
 
+### Body：一个槽位的具名实现（2026-11-09 落地）
+
+里程碑 1..N 的「把一个家族换成参数化 emitter」需要一个接缝，这就是 `gen/src/body.rs` 的 `Body`。
+
+```
+Slot { symbol, fragment }        // 级联能路由到的符号 + 今天承载它的碎片
+Body { name, slot, source, pred, why, default }
+```
+
+- **槽位用「符号」标识，不用文件位置。** `dispatch::route` 返回 `Routed.kernel`，所以「点 11 跑哪个 body」由表回答，不需要第二张会和它漂移的映射。
+- **同一槽位的两个 Body 是两份实现，不是基准 + 补丁。** 这里不存任何 diff，也没有哪个 body 用另一个来定义;每个 body 自带完整源码(`gen/bodies/<name>.inc`)。里程碑 0 的 emitter 就是「返回这段 bytes」，换成真正的参数化只改这一个 body。
+- **`pred` 既打印成 C++ 又对形状求值**，和级联同一条规则，所以谓词不会和自己的文本漂移。
+- `--pick <点>=<body>` 不是字符串查表：它把点经级联路由到槽位，要求该 body 属于**那个**槽位，再用 body 自己的谓词对该点形状求值，**并指名是哪个合取项不成立**。未登记的点/body、属于别的槽位、谓词拒绝、同一点被选两次，都在写出任何字节之前硬失败。
+
+**第一个槽位**是 `SearchN1FixedLayoutSafe7100000`(点 11)，两个 Body:`n1-wholereduce`(两级 `WholeReduceSum`，默认)与 `n1-fold`(对齐对折到 ≤64 再一次 reduce，`K>=128`)。
+
+**刻意没有做的：`role` 作用域内的覆盖/重叠检查。** 本文件的分派是**单条有序级联，位置即优先级**，重叠由顺序解决，`plan --what-if` 负责报告插入一条闸门会把谁改道。在闸门顺序旁边再放一套消歧机制，等于对「哪条闸门赢」有两个答案。所以 Body 只在**一个闸门的槽位内部**竞争，而该槽位能不能被走到由闸门自己的谓词决定。`emit::tests::a_new_shape_is_served_by_registering_one_gate` 把这件事钉死：新形状靠登记一条闸门服务，但那条闸门必须插在会抢走它的闸门**之前**，否则什么都路由不到。
+
+**验收是行为，不是字节。** 里程碑 1..N 的三条(编译通过 → 15 点全 AC → 无回退)照旧，外加一条：`opdur.sh` 的 op name 要确认 `--pick` 选中的 body 真的被执行到——没有这一条，`--pick` 只是个没人验证的字符串。`check-chunks` 保留为「碎片表没被碰坏」的自检，**不是**变体层的验收条件。
+
 ### 分派级联是数据
 
 `run_kernel` 的 26 条闸门住在 `gen/src/cascade.rs` 的一张表里，每个合取项是一个结构化的
@@ -135,6 +155,15 @@ gen plan --what-if --tiles BM,BN,BK,RV[,prefetch,singleL0] [--launcher <名>] [-
 | `instrument` | **分解探针**：故意算错的测量仪器（见下） | 否 | 否 | 否（禁止提交） |
 | `probe` | `GMM_ASK` 内容预言机，套隐藏点**数据** | 是 | 否 | 否 |
 | `spin` | 藏分：其他点自旋到定值 | 否 | 是 | 否 |
+
+`spin` 已实现（`gen/src/spin.rs`）：`emit --profile spin --isolate <点|0> [--ticks N] [--own-ticks N] -o <路径>`。
+它发的是 `--profile final` 的同一条级联，只把 `run_kernel` 改名成 `GmmRunKernelBody`，再套一个先调它、
+后按点发自旋核的 `run_kernel`。`--isolate 0` 是全点自旋的**标定件**；`--own-ticks` 给被测点自己一个已知
+自旋，两次这样的运行能把我们的时间和该点 tbest 分开解出来。
+
+`GmmProbePoint` 的形状表**由 `dispatch::points()` 打印**，不是手写的 —— 所以这个仪器不可能和生成器对
+「哪个形状是点 11」产生分歧。外部脚本 `tools/isolate.sh` 靠 grep 找接缝、表是手写的，这是两者的区别。
+和 `instrument` 一样，`spin` **拒绝写 stdout**。
 
 `final` 必须**拒绝**生成任何探测/自旋构造，并且拒绝生成按点等值谓词——这是代码层面的合规闸门，不靠人记得删。
 它为此做两件事：不发 `#if GMM_ASK` 钩子，并整片丢掉 `5731-probe-ask.inc`（`emit::OMITTED_IN_FINAL`），

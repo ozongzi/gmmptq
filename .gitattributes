@@ -6,3 +6,9 @@ kernel/** text eol=lf
 # The verbatim fragments must stay byte-identical to the kernel.asc they were
 # cut from, so they are never line-ending-normalized, whatever core.autocrlf says.
 gen/chunks/** -text
+
+# Body sources are alternative implementations of a slot; the default body must
+# stay byte-identical to the fragment it replaces (body::tests::
+# the_default_body_is_the_fragment_it_replaces), so they are not normalized
+# either.
+gen/bodies/** -text
