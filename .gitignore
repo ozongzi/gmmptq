@@ -7,3 +7,6 @@ secrets/accounts/*.new
 
 # cmd.exe ">nul" redirects land here when run from git bash
 nul
+
+# Per-agent scratch copies of kernel/src (see CLAUDE.md multi-agent protocol).
+/work/
