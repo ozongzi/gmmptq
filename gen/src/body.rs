@@ -76,11 +76,18 @@ pub struct Body {
     pub why: &'static str,
 }
 
-pub const SLOTS: &[Slot] = &[Slot {
-    symbol: "SearchN1FixedLayoutSafe7100000",
-    fragment: "1142-n1-fixed-layout-safe.inc",
-    what: "N==1: one dot product per token, reduced inside the vector unit",
-}];
+pub const SLOTS: &[Slot] = &[
+    Slot {
+        symbol: "SearchN1FixedLayoutSafe7100000",
+        fragment: "1142-n1-fixed-layout-safe.inc",
+        what: "N==1: one dot product per token, reduced inside the vector unit",
+    },
+    Slot {
+        symbol: "SearchP10FixedUb7300000",
+        fragment: "3242-fixed-ub-outer.inc",
+        what: "K==1 outer product with a fixed UB layout (namespace p10_fixed_ub)",
+    },
+];
 
 /// The fold needs at least one halving level to exist, i.e. `pairs > 64` where
 /// `pairs = Up(k,32)/2`, so `k >= 128` is the honest lower bound. Below it the
@@ -111,7 +118,46 @@ pub const BODIES: &[Body] = &[
               split points are rounded up to 8 floats because an unaligned \
               vector operand start faults the unit (ACL 507035)",
     },
+    Body {
+        name: "outer-reinterpret",
+        slot: "SearchP10FixedUb7300000",
+        source: "outer-reinterpret.inc",
+        what: "the weight scale aliases wsf_ via ReinterpretCast and is cast in place",
+        default: true,
+        pred: OUTER_PRED,
+        why: OUTER_WHY,
+    },
+    Body {
+        name: "outer-wsraw",
+        slot: "SearchP10FixedUb7300000",
+        source: "outer-wsraw.inc",
+        what: "the weight scale gets its own tensor in the slot wsf_ already reserved, \
+               and is multiplied in without a separate cast pass",
+        default: false,
+        pred: OUTER_PRED,
+        why: OUTER_WHY,
+    },
 ];
+
+/// Both `p10_fixed_ub` bodies are the K==1 outer product, and both read the
+/// weight scale as `float` -- `outer-wsraw` places a `LocalTensor<WScaleT>`
+/// directly in the slot and drops the `CastScale` pass, so a bf16 weight scale
+/// would be read as float and silently compute nonsense.
+///
+/// Gate R already requires `k==1` and gate R.1 already requires `!bf`, so
+/// today these two terms restate conditions the cascade enforces. They are
+/// here because they are conditions of *this implementation*, not of that
+/// gate: the day a new gate reaches this slot -- which is exactly what 14
+/// November invites -- these are what refuse it instead of miscompiling.
+///
+/// Note what is deliberately *not* a term: UB. The two bodies advance `at` by
+/// the same `nUp * sizeof(float)`, the default merely leaving that slot
+/// aliased, so both fit the same budget and gate R.1's `selectedUb <= 188160`
+/// covers them equally.
+const OUTER_PRED: &[Expr] = &[Expr::Cmp(Q::K, Op::Eq, R::Const(1)), Expr::Flag(Q::NotBf)];
+const OUTER_WHY: &str = "the K==1 outer product, reading the weight scale as float: \
+                         k==1 because the body has no reduction loop at all, and !bf \
+                         because it does not cast the scale before using it";
 
 pub fn slots() -> &'static [Slot] {
     SLOTS
@@ -402,6 +448,48 @@ mod tests {
         }
     }
 
+    /// Point 10 is the outer slot's point, and both bodies are pickable.
+    #[test]
+    fn point_ten_resolves_to_the_outer_slot() {
+        let env = Env::default();
+        let points = dispatch::points();
+        let p10 = points.iter().find(|p| p.id == 10).expect("point 10");
+        let s = slot_of_shape(&p10.shape, &env).expect("routes").expect("a registered slot");
+        assert_eq!(s.symbol, "SearchP10FixedUb7300000");
+        for name in ["outer-reinterpret", "outer-wsraw"] {
+            let picks = parse_picks(&format!("10={name}"), &env)
+                .unwrap_or_else(|e| panic!("10={name} should be pickable: {e}"));
+            assert_eq!(picks.len(), 1);
+            assert_eq!(picks[0].body.name, name);
+        }
+    }
+
+    /// The outer bodies' predicate is load-bearing on both of its terms: a
+    /// reduction dimension and a bf16 weight scale are each refused, naming
+    /// the term that failed rather than the body.
+    #[test]
+    fn the_outer_predicate_refuses_a_reduction_and_a_bf16_scale() {
+        let env = Env::default();
+        let points = dispatch::points();
+        let p10 = points.iter().find(|p| p.id == 10).expect("point 10");
+        for name in ["outer-reinterpret", "outer-wsraw"] {
+            let b = body(name).expect(name);
+            assert_eq!(first_rejecting_term(b, &p10.shape, &env), None, "{name} on point 10");
+
+            let mut deep = p10.shape.clone();
+            deep.k = 256;
+            let failing = first_rejecting_term(b, &deep, &env)
+                .unwrap_or_else(|| panic!("{name} must decline K=256"));
+            assert!(failing.contains("==1"), "{name}: the failing term is named: {failing}");
+
+            let mut wide = p10.shape.clone();
+            wide.bf = true;
+            let failing = first_rejecting_term(b, &wide, &env)
+                .unwrap_or_else(|| panic!("{name} must decline a bf16 weight scale"));
+            assert!(failing.contains("bf"), "{name}: the failing term is named: {failing}");
+        }
+    }
+
     /// Point 11 is the slot's point, and both bodies are pickable for it.
     #[test]
     fn point_eleven_resolves_to_the_n1_slot() {
@@ -476,6 +564,91 @@ mod tests {
         let fragment = std::fs::read(dir.join("1142-n1-fixed-layout-safe.inc")).expect("fragment");
         assert!(got[0].1 == fragment, "picking the default changed bytes");
         assert!(overrides(&dir, &[]).expect("none").is_empty());
+    }
+
+    /// No body source may carry the point-9 empty kernel, nor the exact-shape
+    /// gate that reached it.
+    ///
+    /// Three of the five submitted lines hold
+    /// `if (E==4 && M==513 && K==383 && N==257 && gt==0 && bf) {
+    /// Case9EmptyKernel<<<1,...>>>(); return; }` -- one published shape matched
+    /// exactly, answered by a kernel that computes nothing. That is the shape
+    /// rule 2.8 forbids and rule 2.10 names outright, and rule 3 reviews the
+    /// last submission by hand. Bodies are lifted *from those lines*, so this
+    /// is the check that a lift never brings it along.
+    #[test]
+    fn no_body_source_carries_an_empty_kernel_or_a_per_case_shape_gate() {
+        let dir = crate::chunks::chunks_dir().expect("gen/chunks");
+        for b in BODIES {
+            let text = String::from_utf8(source_of(&dir, b).expect("source")).expect("utf8");
+            assert!(
+                !text.contains("Case9EmptyKernel"),
+                "body {} carries Case9EmptyKernel",
+                b.name
+            );
+            assert!(
+                !text.to_lowercase().contains("emptykernel"),
+                "body {} carries an empty kernel",
+                b.name
+            );
+            for shape in per_case_shape_gates() {
+                assert!(
+                    !squash_spaces(&text).contains(&shape),
+                    "body {} carries the per-case shape gate {shape:?}",
+                    b.name
+                );
+            }
+        }
+    }
+
+    /// …and neither may any assembled translation unit, by either profile.
+    /// The body sources are only one way it could get in; this is the check on
+    /// the artefact that would actually be submitted.
+    #[test]
+    fn no_emitted_unit_carries_an_empty_kernel_or_a_per_case_shape_gate() {
+        let dir = crate::chunks::chunks_dir().expect("gen/chunks");
+        let env = Env::default();
+        let picks = parse_picks("11=n1-fold,10=outer-wsraw", &env).expect("pickable");
+        let units: Vec<(&str, Vec<u8>)> = vec![
+            ("final", crate::emit::final_profile(&dir).expect("final")),
+            ("final+picks", crate::emit::final_with_picks(&dir, &picks).expect("picked")),
+            (
+                "spin",
+                crate::spin::assemble(&dir, &crate::cascade::cascade(), &[], 11, crate::spin::DEFAULT_TICKS, 0).expect("spin"),
+            ),
+        ];
+        for (what, bytes) in units {
+            let text = String::from_utf8(bytes).expect("utf8");
+            let flat = squash_spaces(&text);
+            assert_eq!(
+                text.matches("Case9EmptyKernel").count(),
+                0,
+                "{what} carries Case9EmptyKernel"
+            );
+            for shape in per_case_shape_gates() {
+                assert!(
+                    !flat.contains(&shape),
+                    "{what} carries the per-case shape gate {shape:?}"
+                );
+            }
+        }
+    }
+
+    /// The fifteen published shapes, as the conjunction a per-case gate would
+    /// have to spell. Built from the point table so a new point is covered
+    /// without anyone remembering to add it here.
+    fn per_case_shape_gates() -> Vec<String> {
+        dispatch::points()
+            .iter()
+            .map(|p| {
+                let s = &p.shape;
+                format!("M=={}&&K=={}&&N=={}", s.m, s.k, s.n)
+            })
+            .collect()
+    }
+
+    fn squash_spaces(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     /// The fold body must really be a different implementation, and must not

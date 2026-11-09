@@ -1635,6 +1635,110 @@ pub fn find<'a>(nodes: &'a [Node], label: &str) -> Option<&'a Gate> {
     gates(nodes).into_iter().find(|g| g.label == label)
 }
 
+/// Replace a gate's tile geometry in place, keeping `target`/`copy`/`nested`.
+///
+/// This is the *other* axis a point can be moved on, and it is not the body
+/// axis. Point 9 is the case that made the difference obvious: the submitted
+/// line that runs it 26% faster has the identical gate predicate and the
+/// identical `CubeFullKUnitBody` text, and differs only in
+/// `ConfigureCubeFullK<64,128,384,32,true,true>` versus
+/// `<96,128,384,48,false,true>`. Registering that as a `body::Body` would have
+/// put a parameter change in a slot meant for implementations, so tiles get
+/// their own override -- which is also what `DESIGN.md`'s M1 ("cube 的 tile
+/// 几何") is about.
+///
+/// A gate with no `Configure` term is an error rather than a silent no-op: the
+/// caller asked to retile something that has no tiles.
+pub fn set_tiles(nodes: &mut [Node], label: &str, tiles: Tiles) -> Result<Cfg, String> {
+    fn in_gate(gate: &mut Gate, label: &str, tiles: Tiles) -> Option<Result<Cfg, String>> {
+        if gate.label == label {
+            let found = gate.pred.iter_mut().find_map(|term| match term {
+                Expr::Configure(cfg) => Some(cfg),
+                _ => None,
+            });
+            return Some(match found {
+                Some(cfg) => {
+                    let before = *cfg;
+                    cfg.bm = tiles.bm;
+                    cfg.bn = tiles.bn;
+                    cfg.bk = tiles.bk;
+                    cfg.rv = tiles.rv;
+                    cfg.prefetch = tiles.prefetch;
+                    cfg.single_l0 = tiles.single_l0;
+                    Ok(before)
+                }
+                None => Err(format!(
+                    "gate {label:?} has no Configure term, so it has no tile geometry to set"
+                )),
+            });
+        }
+        gate.inner.iter_mut().find_map(|g| in_gate(g, label, tiles))
+    }
+    for node in nodes.iter_mut() {
+        if let Node::Gate(gate) = node {
+            if let Some(result) = in_gate(gate, label, tiles) {
+                return result;
+            }
+        }
+    }
+    let known: Vec<&str> = gates(nodes).iter().map(|g| g.label).collect();
+    Err(format!(
+        "no gate labelled {label:?}; the table's gates are {}",
+        known.join(" ")
+    ))
+}
+
+/// The six numbers `ConfigureCubeFullK` is instantiated with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tiles {
+    pub bm: u32,
+    pub bn: u32,
+    pub bk: u32,
+    pub rv: u32,
+    pub prefetch: bool,
+    pub single_l0: bool,
+}
+
+impl Tiles {
+    /// `BM,BN,BK,RV[,prefetch,singleL0]`, the spelling `plan --what-if --tiles`
+    /// already takes.
+    pub fn parse(spec: &str) -> Result<Tiles, String> {
+        let f: Vec<&str> = spec.split(',').map(str::trim).collect();
+        if f.len() != 4 && f.len() != 6 {
+            return Err(format!(
+                "--tiles {spec:?}: want BM,BN,BK,RV or BM,BN,BK,RV,prefetch,singleL0"
+            ));
+        }
+        let num = |at: usize, name: &str| -> Result<u32, String> {
+            f[at]
+                .parse::<u32>()
+                .map_err(|_| format!("--tiles {spec:?}: {name} {:?} is not a number", f[at]))
+                .and_then(|v| {
+                    if v == 0 {
+                        Err(format!("--tiles {spec:?}: {name} must not be zero"))
+                    } else {
+                        Ok(v)
+                    }
+                })
+        };
+        let flag = |at: usize, name: &str| -> Result<bool, String> {
+            match f[at] {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                other => Err(format!("--tiles {spec:?}: {name} {other:?} is not true or false")),
+            }
+        };
+        Ok(Tiles {
+            bm: num(0, "BM")?,
+            bn: num(1, "BN")?,
+            bk: num(2, "BK")?,
+            rv: num(3, "RV")?,
+            prefetch: if f.len() == 6 { flag(4, "prefetch")? } else { true },
+            single_l0: if f.len() == 6 { flag(5, "singleL0")? } else { false },
+        })
+    }
+}
+
 /// The chain from the outermost gate down to `label`, for bound derivation.
 pub fn chain_to<'a>(nodes: &'a [Node], label: &str) -> Option<Vec<&'a Gate>> {
     fn descend<'a>(gate: &'a Gate, label: &str, acc: &mut Vec<&'a Gate>) -> bool {

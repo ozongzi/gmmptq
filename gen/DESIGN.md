@@ -136,6 +136,48 @@ Body { name, slot, source, pred, why, default }
 
 **验收是行为，不是字节。** 里程碑 1..N 的三条(编译通过 → 15 点全 AC → 无回退)照旧，外加一条：`opdur.sh` 的 op name 要确认 `--pick` 选中的 body 真的被执行到——没有这一条，`--pick` 只是个没人验证的字符串。`check-chunks` 保留为「碎片表没被碰坏」的自检，**不是**变体层的验收条件。
 
+
+#### 两条轴：body 和 tile 几何
+
+把提交线的优势搬回生成器时，差异**不一定**在 body 文本里。实测的三个可读 slot 分成两类：
+
+| 点 | gdef | 最好 | 差 | 差在哪 | 怎么登记 |
+| --- | --- | --- | --- | --- | --- |
+| 11 | 8.040 | 6.960 `0ce7a4f1` | +15.5% | 归约实现 | `Body` `n1-fold` |
+| 10 | 7.140 | 5.780 `8d626cde` | +23.5% | `FixedUbOuter` 的 23 行真实代码 | `Body` `outer-wsraw` |
+| 9 | 19.900 | 15.800 `0ce7a4f1` | +26.0% | **只有 tile 几何** | `--tiles W=…` |
+
+点 9 是把这件事逼出来的那个：那条快 26% 的线里，闸门 W 的谓词**逐字相同**、
+`CubeFullKUnitBody` 的文本**逐字相同**，唯一的差别是
+`ConfigureCubeFullK<64,128,384,32,true,true>` 对 `<96,128,384,48,false,true>`。
+把它登记成 `Body` 就是把一个**参数**塞进一个为**实现**准备的槽位 —— 所以 tile 有自己的覆盖：
+
+```
+emit --profile final --tiles W=96,128,384,48,false,true
+emit --profile final --pick 11=n1-fold,10=outer-wsraw --tiles W=96,128,384,48,false,true
+```
+
+`cascade::set_tiles` 原地改那条闸门的 `Cfg`，保留 `target`/`copy`/`nested`，并**返回原值**好打印。
+闸门不存在、或那条闸门没有 `Configure` 项，都报错而不是静默空转。
+这也正是 M1（「cube 的 tile 几何」）的轴，`plan --what-if --tiles` 用的是同一个拼写。
+
+**注意另外 12 个点不要登记变体。** 判题器逐点 σ 2.1–4.7%、本地同量级，所以只有远大于 9% 的差读得出来；
+那 12 个点全在 ±7% 内，点 3 还是 gdef 最快。没有测量支撑的变体就是过拟合。
+
+#### 不许带进来的东西
+
+五条提交线里有三条（`df1bea1b` / `26a7ada0` / `8d626cde`）带着
+
+```
+if (E==4 && M==513 && K==383 && N==257 && gt==0 && bf) { Case9EmptyKernel<<<1,...>>>(); return; }
+```
+
+一个发布形状精确匹配、交给一个什么都不算的核 —— 规则 2 之 8 禁的形状、规则 2 之 10 点名的做法，
+而规则 3 手审的正是最后一次提交。body 是**从这些线里摘出来的**，所以有两个测试盯着：
+`no_body_source_carries_an_empty_kernel_or_a_per_case_shape_gate` 查每个 body 源码，
+`no_emitted_unit_carries_an_empty_kernel_or_a_per_case_shape_gate` 查 `final` / `final+pick` / `spin`
+三种产物。后者的形状清单由 `dispatch::points()` 生成，所以新增点自动被覆盖。
+点 9 的 body 因此只能从 `0ce7a4f1` 取（它没有那个门，15.800 是合法读数）。
 ### 分派级联是数据
 
 `run_kernel` 的 26 条闸门住在 `gen/src/cascade.rs` 的一张表里，每个合取项是一个结构化的

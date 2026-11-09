@@ -30,7 +30,7 @@ fn usage() -> ! {
         "gen <command>\n\
          \n\
          emit --profile <name> [-o <path>]   generate kernel.asc (stdout without -o)\n\
-         emit --profile final --pick <point>=<body>[,…] [-o <path>]\n\
+         emit --profile final --pick <point>=<body>[,…] [--tiles <gate>=BM,BN,BK,RV[,pf,sl0]]\n\
          \x20                                   choose a named body implementation per point\n\
          emit --profile instrument --probe <name> -o <path>\n\
          \x20                                   a WRONG-ON-PURPOSE measurement kernel\n\
@@ -140,12 +140,31 @@ fn cmd_emit(argv: &[String]) -> i32 {
     let mut isolate: Option<u32> = None;
     let mut ticks: u64 = spin::DEFAULT_TICKS;
     let mut own_ticks: u64 = 0;
+    let mut tiles: Vec<(String, cascade::Tiles)> = Vec::new();
     let mut at = 2;
     while at < argv.len() {
         match argv[at].as_str() {
             "--probe" => {
                 let Some(name) = argv.get(at + 1) else { usage() };
                 which_probe = Some(name.clone());
+                at += 2;
+            }
+            "--tiles" => {
+                let Some(spec) = argv.get(at + 1) else { usage() };
+                let Some((gate, geom)) = spec.split_once('=') else {
+                    eprintln!(
+                        "gen emit: --tiles wants <gate>=BM,BN,BK,RV[,prefetch,singleL0], \
+                         for example W=96,128,384,48,false,true"
+                    );
+                    return 2;
+                };
+                match cascade::Tiles::parse(geom) {
+                    Ok(t) => tiles.push((gate.trim().to_string(), t)),
+                    Err(error) => {
+                        eprintln!("gen emit: {error}");
+                        return 2;
+                    }
+                }
                 at += 2;
             }
             "--pick" => {
@@ -233,12 +252,31 @@ fn cmd_emit(argv: &[String]) -> i32 {
             }
         },
     };
-    if !picks.is_empty() && !matches!(profile, Profile::Final | Profile::Spin) {
-        eprintln!(
-            "gen emit: --pick applies to --profile final and --profile spin, not {}",
-            profile.name()
-        );
-        return 2;
+    for (flag, empty) in [("--pick", picks.is_empty()), ("--tiles", tiles.is_empty())] {
+        if !empty && !matches!(profile, Profile::Final | Profile::Spin) {
+            eprintln!(
+                "gen emit: {flag} applies to --profile final and --profile spin, not {}",
+                profile.name()
+            );
+            return 2;
+        }
+    }
+
+    // The tile overrides are applied to a copy of the table, so `plan` and the
+    // tests still see the shipped geometry.
+    let mut nodes = cascade::cascade();
+    for (gate, t) in &tiles {
+        match cascade::set_tiles(&mut nodes, gate, *t) {
+            Ok(before) => eprintln!(
+                "tiles    gate {gate:<4} {},{},{},{},{},{} -> {},{},{},{},{},{}",
+                before.bm, before.bn, before.bk, before.rv, before.prefetch, before.single_l0,
+                t.bm, t.bn, t.bk, t.rv, t.prefetch, t.single_l0
+            ),
+            Err(error) => {
+                eprintln!("gen emit: {error}");
+                return 2;
+            }
+        }
     }
 
     match profile {
@@ -248,7 +286,7 @@ fn cmd_emit(argv: &[String]) -> i32 {
                 return 2;
             }
         }
-        Profile::Final => return emit_final(&dir, out.as_deref(), &picks),
+        Profile::Final => return emit_final(&dir, out.as_deref(), &picks, &nodes),
         Profile::Instrument => {
             return emit_instrument(&dir, out.as_deref(), which_probe.as_deref());
         }
@@ -260,7 +298,7 @@ fn cmd_emit(argv: &[String]) -> i32 {
                 );
                 return 2;
             };
-            return emit_spin(&dir, out.as_deref(), &picks, isolate, ticks, own_ticks);
+            return emit_spin(&dir, out.as_deref(), &picks, &nodes, isolate, ticks, own_ticks);
         }
         Profile::Probe => {
             return not_yet(
@@ -337,19 +375,19 @@ fn emit_final(
     dir: &std::path::Path,
     out: Option<&std::path::Path>,
     picks: &[body::Pick],
+    nodes: &[cascade::Node],
 ) -> i32 {
-    let nodes = cascade::cascade();
     for p in picks {
         eprintln!("pick     point {:<3} body {:<16} {}", p.point, p.body.name, p.body.what);
     }
-    let bytes = match emit::final_with_picks(dir, picks) {
+    let bytes = match emit::final_with_picks_on(dir, nodes, picks) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("gen emit --profile final: {error}");
             return 1;
         }
     };
-    let gates = cascade::gates(&nodes).len();
+    let gates = cascade::gates(nodes).len();
     match out {
         Some(path) => {
             if let Err(error) = std::fs::write(path, &bytes) {
@@ -387,6 +425,7 @@ fn emit_spin(
     dir: &std::path::Path,
     out: Option<&std::path::Path>,
     picks: &[body::Pick],
+    nodes: &[cascade::Node],
     isolate: u32,
     ticks: u64,
     own_ticks: u64,
@@ -398,7 +437,7 @@ fn emit_spin(
             return 1;
         }
     };
-    let bytes = match spin::assemble(dir, &overrides, isolate, ticks, own_ticks) {
+    let bytes = match spin::assemble(dir, nodes, &overrides, isolate, ticks, own_ticks) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("gen emit --profile spin: {error}");

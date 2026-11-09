@@ -29,6 +29,7 @@
 
 use std::path::Path;
 
+#[allow(unused_imports)]
 use crate::cascade;
 use crate::chunks;
 use crate::dispatch;
@@ -163,13 +164,14 @@ pub fn tick_vector(isolate: u32, ticks: u64, own: u64) -> Result<Vec<u64>, Strin
 /// -- an isolation measures the kernel we would actually submit.
 pub fn assemble(
     dir: &Path,
+    nodes: &[crate::cascade::Node],
     overrides: &[(String, Vec<u8>)],
     isolate: u32,
     ticks: u64,
     own: u64,
 ) -> Result<Vec<u8>, String> {
     let vector = tick_vector(isolate, ticks, own)?;
-    let dispatch_body = emit::run_kernel(&cascade::cascade())?;
+    let dispatch_body = emit::run_kernel(nodes)?;
     let renamed = dispatch_body.replacen(
         "extern \"C\" void run_kernel(",
         "static void GmmRunKernelBody(",
@@ -272,7 +274,7 @@ mod tests {
     #[test]
     fn the_spin_unit_renames_the_dispatch_and_wraps_it() {
         let dir = chunks::chunks_dir().expect("gen/chunks");
-        let bytes = assemble(&dir, &[], 11, DEFAULT_TICKS, 0).expect("spin unit");
+        let bytes = assemble(&dir, &cascade::cascade(), &[], 11, DEFAULT_TICKS, 0).expect("spin unit");
         let text = String::from_utf8(bytes).expect("utf8");
         assert_eq!(text.matches("extern \"C\" void run_kernel(").count(), 1);
         assert_eq!(text.matches("static void GmmRunKernelBody(").count(), 1);
@@ -289,7 +291,7 @@ mod tests {
     #[test]
     fn final_still_refuses_what_spin_emits() {
         let dir = chunks::chunks_dir().expect("gen/chunks");
-        let spun = String::from_utf8(assemble(&dir, &[], 11, DEFAULT_TICKS, 0).expect("spin"))
+        let spun = String::from_utf8(assemble(&dir, &cascade::cascade(), &[], 11, DEFAULT_TICKS, 0).expect("spin"))
             .expect("utf8");
         let clean = String::from_utf8(emit::final_profile(&dir).expect("final")).expect("utf8");
         for needle in ["GetSystemCycle", "GmmProbeSpin", "GMM_PROBE"] {
@@ -307,7 +309,7 @@ mod tests {
         let picks = crate::body::parse_picks("11=n1-fold", &env).expect("pickable");
         let overrides = crate::body::overrides(&dir, &picks).expect("overrides");
         let text = String::from_utf8(
-            assemble(&dir, &overrides, 11, DEFAULT_TICKS, 0).expect("spin unit"),
+            assemble(&dir, &cascade::cascade(), &overrides, 11, DEFAULT_TICKS, 0).expect("spin unit"),
         )
         .expect("utf8");
         assert!(text.contains("Add(f[c],f[c],f[half+c]"), "the picked fold is not in the unit");

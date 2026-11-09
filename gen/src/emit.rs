@@ -164,8 +164,18 @@ pub fn final_profile(dir: &Path) -> Result<Vec<u8>, String> {
 
 /// `--profile final --pick …`: the shipped cascade with chosen bodies.
 pub fn final_with_picks(dir: &Path, picks: &[crate::body::Pick]) -> Result<Vec<u8>, String> {
+    final_with_picks_on(dir, &cascade::cascade(), picks)
+}
+
+/// As `final_with_picks`, on a given cascade -- the shipped one, or one whose
+/// tile geometry `--tiles` has overridden.
+pub fn final_with_picks_on(
+    dir: &Path,
+    nodes: &[Node],
+    picks: &[crate::body::Pick],
+) -> Result<Vec<u8>, String> {
     let overrides = crate::body::overrides(dir, picks)?;
-    assemble_with(dir, &cascade::cascade(), &overrides)
+    assemble_with(dir, nodes, &overrides)
 }
 
 /// The hand-written `run_kernel` the generated one replaces, for diffing.
@@ -488,6 +498,75 @@ mod tests {
             let error = assemble_with(&dir, &nodes, &[(name.to_string(), b"x".to_vec())])
                 .expect_err("must refuse");
             assert!(error.contains(why), "{name}: {error}");
+        }
+    }
+
+    /// Point 9's axis is tiles, not bodies. The line that runs it 26% faster
+    /// has gate W's identical predicate and the identical `CubeFullKUnitBody`
+    /// text, and differs only in the `ConfigureCubeFullK` instantiation --
+    /// `<64,128,384,32,true,true>` against `<96,128,384,48,false,true>`. So
+    /// retiling W must change the emitted C++ and nothing else, and it must
+    /// not re-route any point.
+    #[test]
+    fn retiling_a_gate_changes_its_instantiation_and_nothing_else() {
+        let dir = chunks::chunks_dir().expect("gen/chunks");
+        let env = Env::default();
+        let shipped = cascade::cascade();
+        let before = assemble(&dir, &shipped).expect("assemble");
+        assert!(
+            String::from_utf8_lossy(&before).contains("ConfigureCubeFullK<64,128,384,32,true,true>"),
+            "gate W's shipped geometry is not what this test assumes"
+        );
+
+        let mut nodes = cascade::cascade();
+        let was = cascade::set_tiles(
+            &mut nodes,
+            "W",
+            cascade::Tiles { bm: 96, bn: 128, bk: 384, rv: 48, prefetch: false, single_l0: true },
+        )
+        .expect("gate W has tiles");
+        assert_eq!((was.bm, was.rv, was.prefetch), (64, 32, true), "the old geometry is reported");
+
+        let after = String::from_utf8(assemble(&dir, &nodes).expect("assemble")).expect("utf8");
+        assert!(
+            after.contains("ConfigureCubeFullK<96,128,384,48,false,true>"),
+            "the new geometry is not in the emitted file"
+        );
+        assert!(!after.contains("ConfigureCubeFullK<64,128,384,32,true,true>"));
+
+        // Every point still routes to the gate it did: tiles are a parameter,
+        // not a predicate.
+        for point in dispatch::points() {
+            let a = dispatch::route(&point.shape, &env).expect("routes");
+            let b = dispatch::route_with(&nodes, &point.shape, &env).expect("routes");
+            assert_eq!(a.gate, b.gate, "point {} was re-routed by a retile", point.id);
+        }
+    }
+
+    /// A retile of something without tiles, or of a gate that does not exist,
+    /// is refused rather than silently doing nothing.
+    #[test]
+    fn retiling_the_wrong_thing_is_refused() {
+        let mut nodes = cascade::cascade();
+        let t = cascade::Tiles { bm: 1, bn: 1, bk: 1, rv: 1, prefetch: true, single_l0: false };
+        let e = cascade::set_tiles(&mut nodes, "NoSuchGate", t).expect_err("unknown gate");
+        assert!(e.contains("no gate labelled"), "{e}");
+        assert!(e.contains(" W"), "the error lists the real gates: {e}");
+
+        // Gate P (point 11) is a vector path with no ConfigureCubeFullK.
+        let e = cascade::set_tiles(&mut nodes, "P", t).expect_err("no tiles");
+        assert!(e.contains("no tile geometry"), "{e}");
+    }
+
+    /// The tile spelling is the one `plan --what-if --tiles` already takes.
+    #[test]
+    fn the_tile_spec_parses_and_rejects_nonsense() {
+        let t = cascade::Tiles::parse("96,128,384,48,false,true").expect("six fields");
+        assert_eq!((t.bm, t.bn, t.bk, t.rv, t.prefetch, t.single_l0), (96, 128, 384, 48, false, true));
+        let t = cascade::Tiles::parse("64,128,384,32").expect("four fields");
+        assert_eq!((t.bm, t.prefetch, t.single_l0), (64, true, false));
+        for bad in ["96,128,384", "96,128,384,0,false,true", "a,128,384,48", "96,128,384,48,yes,true"] {
+            assert!(cascade::Tiles::parse(bad).is_err(), "{bad:?} should not parse");
         }
     }
 
