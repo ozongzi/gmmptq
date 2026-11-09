@@ -1,5 +1,5 @@
 [workspace]
-members = ["lab", "fixture"]
+members = ["lab", "fixture", "kernel/asm"]
 resolver = "3"
 
 [profile.release]

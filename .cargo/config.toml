@@ -1,6 +1,6 @@
-# `cargo lab <command>`, `cargo fixture <command>` and `cargo gen <command>` run
+# `cargo lab <command>`, `cargo fixture <command>` and `cargo asm` run
 # the three binaries from anywhere in the workspace.
 [alias]
 lab = "run --release --quiet -p lab --"
 fixture = "run --release --quiet -p fixture --"
-gen = "run --quiet -p gen --"
+asm = "run --release --quiet -p asm --"

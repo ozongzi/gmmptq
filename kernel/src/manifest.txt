@@ -1,0 +1,51 @@
+# Assembly order for kernel/kernel.asc. One path per line, relative to
+# kernel/src; `#` starts a comment. `cargo asm` concatenates these into the
+# single file the judge compiles, so the order is load-bearing: the result is
+# one translation unit and every declaration must precede its uses.
+
+prologue.asc
+
+# Shared vocabulary: budgets, Plan/VTiling, group-list traversal, and the
+# dequantization primitives the families build on.
+core/types.asc
+core/schedule.asc
+core/dequant.asc
+core/scalar.asc
+
+# Host side: ACL wrappers, then the tiling planners.
+host/acl.asc
+host/plan_cube.asc
+host/plan_vector.asc
+host/plan_short_group.asc
+
+# Cube families. The bodies are shared inline templates; the global kernels and
+# launchers that instantiate them live under launch/.
+cube/resources.asc
+cube/mix.asc
+cube/full_k_body.asc
+cube/unit_body.asc
+cube/half_body.asc
+cube/half_pair_body.asc
+cube/pack_weights.asc
+
+# Vector (AIV-only) families, widest first, down to the single-core scalar
+# kernels for the degenerate shapes.
+vector/outer.asc
+vector/short_group.asc
+vector/row_dot.asc
+vector/n1_pairs.asc
+vector/narrow_n1.asc
+vector/long_dot.asc
+vector/tiny_row.asc
+vector/tiny_expert.asc
+vector/tiny_scalar.asc
+vector/tiny_capacity.asc
+
+# Cube launchers: shape packing, grid sizing, scratch and stream sync.
+launch/cube_full_k.asc
+launch/cube_unit.asc
+launch/cube_half.asc
+launch/cube_packed.asc
+
+# The shape classifier that picks a family.
+dispatch.asc

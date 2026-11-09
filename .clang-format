@@ -1,0 +1,7 @@
+# Google style, with the Ascend C extensions the kernel sources use.
+BasedOnStyle: Google
+Standard: c++17
+ColumnLimit: 88
+AttributeMacros: ['__aicore__', '__global__', '__gm__']
+StatementMacros: ['KERNEL_TASK_TYPE_DEFAULT']
+WhitespaceSensitiveMacros: ['GMM_BY_DTYPE', 'GMM_BY_DTYPE_1T', 'GMM_BY_DTYPE_2T', 'GMM_BY_BF', 'GMM_BY_BF_CALL']
