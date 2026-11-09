@@ -3,11 +3,12 @@
 #
 #   compare.sh <cases dir> <driver> [iters] [split]
 #
-# tbest is the judge's best recorded time for that point on the judge's own
-# machine; the measurement here is this container's Ascend910_9362, which is
-# the slowest part in the family. The two are NOT directly comparable -- see
-# design.md -- so the ratio column is a bearing, not a verdict. What it is
-# good for is comparing two kernels on the same box.
+# tbest is the judge's best recorded time for that point, measured on the
+# judge's machine; the measurement here is this container's. Whether the two
+# machines are comparable has never been established, so the ratio column is a
+# bearing, not a verdict. What this script is good for is comparing two
+# kernels on the same box. The TBEST array below is also stale -- see
+# UPDATES.md for the current figures.
 set -u
 CASES=${1:?cases dir}
 DRIVER=${2:?driver}
